@@ -17,6 +17,7 @@ This document explains what it is, why it's built the way it is, what has actual
 - [Project layout](#project-layout)
 - [Honest limitations and tradeoffs](#honest-limitations-and-tradeoffs)
 - [How this compares to similar projects](#how-this-compares-to-similar-projects)
+- [Why not just prompt Claude Code directly?](#why-not-just-prompt-claude-code-directly)
 - [Security notes](#security-notes)
 - [Possible future work](#possible-future-work)
 
@@ -195,6 +196,24 @@ The closest prior art is **[MetaGPT](https://github.com/FoundationAgents/MetaGPT
 ChatDev is a similar-genre "AI software company" simulation with dialogue-driven agent communication — also its own framework, predating the Claude Agent SDK.
 
 We didn't find any existing project combining AutoGen's `GraphFlow` with the Claude Agent SDK in this way — the pairing of deterministic graph-based process control with a full agentic execution backend for the engineering roles appears to be novel, for whatever that's worth given the immaturity noted above.
+
+## Why not just prompt Claude Code directly?
+
+A fair question, worth answering honestly rather than defensively: **we don't have proof this beats a single well-prompted Claude Code session doing the whole thing end to end.** That's a genuine gap, not something to paper over.
+
+The theoretical case for the multi-agent structure:
+
+1. **Forced independent verification.** `qa_engineer` runs in a *separate* session from the engineers, given only the PRD/TECH DESIGN/code — not the engineers' reasoning or confidence about their own work. It has no "I already convinced myself this is right" momentum. A single continuous session reviewing its own output doesn't have that separation — it's the same context reviewing itself, which is exactly the blind spot human teams built dedicated QA roles to avoid in the first place.
+2. **A structural checkpoint specifically against goal-drift.** `uat_reviewer` re-checks against the *original one-line goal*, not the PRD — designed to catch "the PRD subtly misread the goal, and everything downstream is a correct implementation of the wrong thing." A single session has no equivalent forced re-grounding step unless someone remembers to ask for one.
+3. **Deterministic, bounded rework** — `QA_FAIL` routes only to the owning engineer(s), capped at 3 loops — versus an unstructured session where "keep fixing it" has no natural stopping rule.
+4. **A reproducible paper trail** (numbered ACs, a QA traceability table, a UAT walkthrough, a final delivery report) that exists because the structure requires it, not because someone remembered to ask for it.
+
+Where the skeptic is right:
+
+- This costs meaningfully more — we hit a real Claude Code session/usage limit running it (see [Limitations](#honest-limitations-and-tradeoffs)) — versus one well-scoped Claude Code session, which already runs its own internal plan → write → test → fix loop without any of this scaffolding.
+- For simple or small tasks, this is overhead with no demonstrated payoff. The multi-agent split only earns its cost on complexity where independent review genuinely catches something a single self-reviewing pass would miss — where that threshold actually is has not been measured.
+- The whole pipeline still shares one blind spot with "just prompt Claude Code directly": there's no human and no external ground truth anywhere in the loop except the original one-line goal. If every agent shares the same wrong assumption about ambiguous phrasing, nothing here catches that either.
+- This is genuinely unproven right now, not just under-marketed. The honest way to settle it is to run the same goal both ways — this pipeline vs. one direct Claude Code session — and compare defect rates and cost, which is exactly the evaluation harness listed under [Possible future work](#possible-future-work).
 
 ## Security notes
 
