@@ -1,11 +1,13 @@
 """GraphFlow pipeline: PM → Architect → (FE ∥ BE ∥ OPS) → QA → UAT, with rework loops."""
 
-from autogen_agentchat.agents import AssistantAgent
+from pathlib import Path
+from typing import Sequence
+
 from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_agentchat.messages import BaseChatMessage
 from autogen_agentchat.teams import DiGraphBuilder, GraphFlow
-from autogen_core.models import ChatCompletionClient
 
+from .claude_code_agent import ClaudeCodeAgent
 from .prompts import (
     ARCHITECT_PROMPT,
     BE_PROMPT,
@@ -39,22 +41,115 @@ def verdict_is(token: str):
     return check
 
 
-def build_team(model_client: ChatCompletionClient) -> GraphFlow:
-    def agent(name: str, prompt: str) -> AssistantAgent:
-        return AssistantAgent(
+def build_team(workspace: Path) -> GraphFlow:
+    """Build the pipeline. Every agent runs via a real claude_agent_sdk
+    session authenticated through the `claude` CLI's own OAuth login — no
+    ANTHROPIC_API_KEY/OPENAI_API_KEY needed. See claude_code_agent.py.
+
+    PM/Architect/UAT/Reporter are pure reasoning roles: same execution
+    backend, but with `allowed_tools=[]` so they can't touch the filesystem.
+    FE/BE/OPS/QA get real file/bash tools scoped to `workspace` (a per-run
+    directory) so they actually write and verify code.
+
+    Workspace layout (also encoded in prompts.py — keep the two in sync):
+      workspace/frontend/   — frontend_engineer's cwd
+      workspace/backend/    — backend_engineer's cwd
+      workspace/            — devops_engineer's and qa_engineer's cwd (root,
+                               so OPS can reference ./frontend and ./backend,
+                               and QA can read/test everything); also the
+                               cwd for the tool-less reasoning agents, who
+                               never use it
+    """
+
+    def code_agent(
+        name: str,
+        description: str,
+        prompt: str,
+        cwd: Path,
+        max_turns: int,
+        allowed_tools: Sequence[str] | None = None,
+    ) -> ClaudeCodeAgent:
+        kwargs = {} if allowed_tools is None else {"allowed_tools": allowed_tools}
+        return ClaudeCodeAgent(
             name=name,
-            model_client=model_client,
-            system_message=GLOBAL_RULES + "\n\n" + prompt,
+            description=description,
+            system_prompt=GLOBAL_RULES + "\n\n" + prompt,
+            cwd=cwd,
+            max_turns=max_turns,
+            **kwargs,
         )
 
-    pm = agent("product_manager", PM_PROMPT)
-    architect = agent("solution_architect", ARCHITECT_PROMPT)
-    fe = agent("frontend_engineer", FE_PROMPT)
-    be = agent("backend_engineer", BE_PROMPT)
-    ops = agent("devops_engineer", OPS_PROMPT)
-    qa = agent("qa_engineer", QA_PROMPT)
-    uat = agent("uat_reviewer", UAT_PROMPT)
-    reporter = agent("release_reporter", REPORTER_PROMPT)
+    # Tool-less reasoning roles never make a tool call, so they always finish
+    # in a single turn — a small cap here is just a runaway guard, not a
+    # working budget. Engineer/QA budgets are a real cost lever: each is a
+    # full agentic session (writing files, running builds/tests), and QA
+    # rework loops repeat FE/BE/OPS, so these numbers multiply fast across a
+    # run. Lower them further (or set AITEAM_CODE_MODEL to a cheaper model)
+    # if you're hitting the Claude Code session/usage limit.
+    REASONING_MAX_TURNS = 3
+    ENGINEER_MAX_TURNS = 20
+    QA_MAX_TURNS = 20
+
+    pm = code_agent(
+        "product_manager",
+        "Grooms the raw goal into a build-ready PRD.",
+        PM_PROMPT,
+        cwd=workspace,
+        max_turns=REASONING_MAX_TURNS,
+        allowed_tools=[],
+    )
+    architect = code_agent(
+        "solution_architect",
+        "Turns the PRD into a production-grade technical design.",
+        ARCHITECT_PROMPT,
+        cwd=workspace,
+        max_turns=REASONING_MAX_TURNS,
+        allowed_tools=[],
+    )
+    fe = code_agent(
+        "frontend_engineer",
+        "Implements [FE] tasks from the TECH DESIGN by writing real code to the shared workspace.",
+        FE_PROMPT,
+        cwd=workspace / "frontend",
+        max_turns=ENGINEER_MAX_TURNS,
+    )
+    be = code_agent(
+        "backend_engineer",
+        "Implements [BE] tasks from the TECH DESIGN by writing real code to the shared workspace.",
+        BE_PROMPT,
+        cwd=workspace / "backend",
+        max_turns=ENGINEER_MAX_TURNS,
+    )
+    ops = code_agent(
+        "devops_engineer",
+        "Implements [OPS] tasks from the TECH DESIGN by writing real Docker/CI config to the shared workspace.",
+        OPS_PROMPT,
+        cwd=workspace,
+        max_turns=ENGINEER_MAX_TURNS,
+    )
+    qa = code_agent(
+        "qa_engineer",
+        "Verifies the real implementation in the shared workspace against the PRD and TECH DESIGN.",
+        QA_PROMPT,
+        cwd=workspace,
+        max_turns=QA_MAX_TURNS,
+    )
+    uat = code_agent(
+        "uat_reviewer",
+        "The same PM performing UAT against the original goal.",
+        UAT_PROMPT,
+        cwd=workspace,
+        max_turns=REASONING_MAX_TURNS,
+        allowed_tools=[],
+    )
+    reporter = code_agent(
+        "release_reporter",
+        "Summarizes the approved run into a final delivery report.",
+        REPORTER_PROMPT,
+        cwd=workspace,
+        max_turns=REASONING_MAX_TURNS,
+        allowed_tools=[],
+    )
 
     builder = DiGraphBuilder()
     for a in (pm, architect, fe, be, ops, qa, uat, reporter):
