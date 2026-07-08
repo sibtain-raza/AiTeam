@@ -16,7 +16,7 @@ from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import BaseChatMessage
 from autogen_agentchat.teams import GraphFlow
 
-from .pipeline import build_team
+from .pipeline import ARTIFACT_DIR_NAME, build_team
 
 
 async def _checkpoint(team: GraphFlow, checkpoint_path: Path, stamp: str, goal: str, workspace: Path) -> None:
@@ -65,6 +65,14 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
                 print(f"\n---------- {message.source} ----------\n{message.to_text()}")
                 with transcript.open("a") as f:
                     f.write(f"## {message.source}\n\n{message.to_text()}\n\n---\n\n")
+                # Persist the latest artifact per source to disk. This is what
+                # the pointer_files mechanism (see pipeline.py / ClaudeCodeAgent)
+                # points agents at on rework turns instead of replaying the
+                # full text — overwriting keeps exactly one file per source,
+                # always the current version.
+                artifact_dir = workspace / ARTIFACT_DIR_NAME
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_dir / f"{message.source}.md").write_text(message.to_text())
                 # Checkpoint after every completed agent turn, so a failure
                 # (crash, hitting the Claude Code session limit, etc.) only
                 # loses the turn in flight — not the whole run.

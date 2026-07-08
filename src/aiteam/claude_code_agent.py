@@ -112,6 +112,33 @@ class ClaudeCodeAgent(BaseChatAgent):
     upstream chat context (PRD, TECH DESIGN, defect reports) doesn't exist
     on disk, so it's replayed as the prompt on every turn, mirroring how
     AssistantAgent's internal model_context accumulates across calls.
+
+    `context_sources` bounds what gets replayed. GraphFlow broadcasts every
+    agent's message to every other agent, so an unfiltered replay grows
+    with the whole transcript — each turn re-sends artifacts the role's own
+    prompt says it doesn't consume (e.g. FE re-reading BE's summaries), and
+    rework loops re-send superseded PRDs/QA reports alongside their
+    replacements. The filter maps source name -> "all" | "latest"; sources
+    not listed are dropped, and "latest" keeps only that source's most
+    recent message. `None` (the default) replays everything unfiltered.
+    `_history` itself always keeps every message — filtering happens at
+    prompt-build time, so checkpoints stay complete and the policy can
+    change between runs without losing data.
+
+    `pointer_files` cuts replay further for tool-using roles: a source
+    listed there renders as a one-line pointer to its on-disk copy
+    (written by main.py under the workspace's artifact dir) instead of
+    full text — but ONLY when that source's message did NOT arrive this
+    turn and the file actually exists. The effectiveness guardrail is the
+    "did not arrive this turn" condition: an artifact is always inlined in
+    full the first time an agent sees it (first pass, or a redesign after
+    a UAT re-scope), so no agent ever has to *retrieve* a contract it was
+    never shown — pointers only replace text the pipeline already
+    delivered whole in an earlier turn and that is sitting unchanged on
+    disk, where Read/Grep can pull back just the needed sections. Never
+    set this for a tool-less role: with no Read tool a pointer is a dead
+    end, which is why it's a separate opt-in rather than a context_sources
+    policy.
     """
 
     def __init__(
@@ -122,6 +149,8 @@ class ClaudeCodeAgent(BaseChatAgent):
         cwd: Path,
         max_turns: int = 20,
         allowed_tools: Sequence[str] = DEFAULT_ALLOWED_TOOLS,
+        context_sources: Mapping[str, str] | None = None,
+        pointer_files: Mapping[str, Path] | None = None,
     ) -> None:
         super().__init__(name, description=description)
         self._system_prompt = system_prompt
@@ -131,6 +160,47 @@ class ClaudeCodeAgent(BaseChatAgent):
         self._history: list[BaseChatMessage] = []
         self._model = os.environ.get("AITEAM_CODE_MODEL")
         self._hooks = _make_hooks(cwd)
+        self._context_sources = dict(context_sources) if context_sources is not None else None
+        self._pointer_files = dict(pointer_files) if pointer_files is not None else None
+
+    def _build_prompt(self, new_sources: set[str] | None = None) -> str:
+        """Render the (filtered) history as the session prompt.
+
+        `new_sources` is the set of sources whose messages arrived THIS
+        turn. When None (e.g. direct calls in tests), pointer substitution
+        is disabled entirely and everything renders inline — the safe
+        default, since a pointer without delta information could hide an
+        artifact the agent has never seen.
+        """
+        if self._context_sources is None:
+            visible = list(self._history)
+        else:
+            last_index = {msg.source: i for i, msg in enumerate(self._history)}
+            visible = [
+                msg
+                for i, msg in enumerate(self._history)
+                if self._context_sources.get(msg.source) == "all"
+                or (self._context_sources.get(msg.source) == "latest" and last_index[msg.source] == i)
+            ]
+
+        parts = []
+        for msg in visible:
+            pointer = (
+                self._pointer_files.get(msg.source)
+                if self._pointer_files is not None and new_sources is not None
+                else None
+            )
+            if pointer is not None and msg.source not in new_sources and pointer.is_file():
+                parts.append(
+                    f"### {msg.source}\n"
+                    f"[Unchanged since an earlier turn — omitted here to save context. "
+                    f"Full text is on disk at: {pointer}\n"
+                    f"Read or grep just the sections you need "
+                    f"(e.g. the contracts/tasks your current defects reference).]"
+                )
+            else:
+                parts.append(f"### {msg.source}\n{msg.to_text()}")
+        return "\n\n".join(parts)
 
     @property
     def produced_message_types(self) -> Sequence[type[BaseChatMessage]]:
@@ -153,7 +223,7 @@ class ClaudeCodeAgent(BaseChatAgent):
         self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
     ) -> Response:
         self._history.extend(messages)
-        prompt = "\n\n".join(f"### {msg.source}\n{msg.to_text()}" for msg in self._history)
+        prompt = self._build_prompt(new_sources={msg.source for msg in messages})
 
         self._cwd.mkdir(parents=True, exist_ok=True)
         options = ClaudeAgentOptions(

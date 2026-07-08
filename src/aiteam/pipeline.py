@@ -26,6 +26,13 @@ MAX_QA_LOOPS = 3
 # Cap generously above 7 + 3*4 + UAT-reject re-scope headroom.
 MAX_MESSAGES = 40
 
+# Where main.py persists each agent's latest artifact inside the run's
+# workspace (<workspace>/.pipeline-docs/<source>.md), and where the
+# pointer_files wiring below tells tool-using agents to find them. The two
+# uses must agree — hence one shared constant. Dot-prefixed so OPS's
+# Dockerfile/.dockerignore conventions treat it as metadata, not app code.
+ARTIFACT_DIR_NAME = ".pipeline-docs"
+
 
 def verdict_is(token: str):
     """Edge condition: the source agent's final non-empty line is exactly `token`.
@@ -74,7 +81,9 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         prompt: str,
         cwd: Path,
         max_turns: int,
+        context_sources: dict[str, str],
         allowed_tools: Sequence[str] | None = None,
+        pointer_files: dict[str, Path] | None = None,
     ) -> ClaudeCodeAgent:
         kwargs = {} if allowed_tools is None else {"allowed_tools": allowed_tools}
         return agent_cls(
@@ -83,6 +92,8 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
             system_prompt=GLOBAL_RULES + "\n\n" + prompt,
             cwd=cwd,
             max_turns=max_turns,
+            context_sources=context_sources,
+            pointer_files=pointer_files,
             **kwargs,
         )
 
@@ -97,12 +108,40 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
     ENGINEER_MAX_TURNS = 20
     QA_MAX_TURNS = 20
 
+    # Context routing: GraphFlow broadcasts every message to every agent, but
+    # each role's replayed prompt is filtered down to the artifacts SPEC.md
+    # section 3 declares as that role's inputs, keeping only the latest
+    # version per source ("latest") — a superseded PRD or old QA report is
+    # wasted tokens and a stale-context hazard. The original user goal
+    # ("user") is kept everywhere: it's one line, and UAT/PM route on it.
+    # Keep these dicts in sync with the "Input:" line of each role's prompt.
+    ENGINEER_CONTEXT = {
+        "user": "all",
+        "solution_architect": "latest",
+        "qa_engineer": "latest",
+    }
+
+    # Pointer routing (tool-using roles only): on turns where a large
+    # artifact is unchanged since the agent last received it (QA rework
+    # loops), replay a one-line pointer to its on-disk copy instead of the
+    # full text — the agent Reads/Greps just the sections its defects
+    # reference. main.py writes these files as each artifact is produced.
+    # First-sight turns always get the full text inline (see
+    # ClaudeCodeAgent docstring), so this never hides an unseen contract.
+    docs = workspace / ARTIFACT_DIR_NAME
+    DESIGN_POINTER = {"solution_architect": docs / "solution_architect.md"}
+    QA_POINTERS = {
+        "product_manager": docs / "product_manager.md",
+        "solution_architect": docs / "solution_architect.md",
+    }
+
     pm = code_agent(
         "product_manager",
         "Grooms the raw goal into a build-ready PRD.",
         PM_PROMPT,
         cwd=workspace,
         max_turns=REASONING_MAX_TURNS,
+        context_sources={"user": "all", "uat_reviewer": "latest"},
         allowed_tools=[],
     )
     architect = code_agent(
@@ -111,6 +150,7 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         ARCHITECT_PROMPT,
         cwd=workspace,
         max_turns=REASONING_MAX_TURNS,
+        context_sources={"user": "all", "product_manager": "latest"},
         allowed_tools=[],
     )
     fe = code_agent(
@@ -119,6 +159,8 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         FE_PROMPT,
         cwd=workspace / "frontend",
         max_turns=ENGINEER_MAX_TURNS,
+        context_sources=ENGINEER_CONTEXT,
+        pointer_files=DESIGN_POINTER,
     )
     be = code_agent(
         "backend_engineer",
@@ -126,6 +168,8 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         BE_PROMPT,
         cwd=workspace / "backend",
         max_turns=ENGINEER_MAX_TURNS,
+        context_sources=ENGINEER_CONTEXT,
+        pointer_files=DESIGN_POINTER,
     )
     ops = code_agent(
         "devops_engineer",
@@ -133,6 +177,8 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         OPS_PROMPT,
         cwd=workspace,
         max_turns=ENGINEER_MAX_TURNS,
+        context_sources=ENGINEER_CONTEXT,
+        pointer_files=DESIGN_POINTER,
     )
     qa = code_agent(
         "qa_engineer",
@@ -140,6 +186,15 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         QA_PROMPT,
         cwd=workspace,
         max_turns=QA_MAX_TURNS,
+        context_sources={
+            "user": "all",
+            "product_manager": "latest",
+            "solution_architect": "latest",
+            "frontend_engineer": "latest",
+            "backend_engineer": "latest",
+            "devops_engineer": "latest",
+        },
+        pointer_files=QA_POINTERS,
         # No Write/Edit: QA verifies and reports defects, it never modifies
         # the code it's independently checking — see README "Access per role".
         allowed_tools=["Read", "Glob", "Grep", "Bash"],
@@ -150,6 +205,14 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         UAT_PROMPT,
         cwd=workspace,
         max_turns=REASONING_MAX_TURNS,
+        context_sources={
+            "user": "all",
+            "product_manager": "latest",
+            "frontend_engineer": "latest",
+            "backend_engineer": "latest",
+            "devops_engineer": "latest",
+            "qa_engineer": "latest",
+        },
         allowed_tools=[],
     )
     reporter = code_agent(
@@ -158,6 +221,16 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
         REPORTER_PROMPT,
         cwd=workspace,
         max_turns=REASONING_MAX_TURNS,
+        context_sources={
+            "user": "all",
+            "product_manager": "latest",
+            "solution_architect": "latest",
+            "frontend_engineer": "latest",
+            "backend_engineer": "latest",
+            "devops_engineer": "latest",
+            "qa_engineer": "latest",
+            "uat_reviewer": "latest",
+        },
         allowed_tools=[],
     )
 
