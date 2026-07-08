@@ -29,6 +29,7 @@ Want to just run it? Jump to [Getting started](#getting-started).
 - [Checkpoint & resume](#checkpoint-resume)
 - [Getting started](#getting-started)
 - [Project layout](#project-layout)
+- [Testing](#testing)
 - [Security & access control](#security-access-control)
 - [Honest limitations and tradeoffs](#honest-limitations-and-tradeoffs)
 - [Comparisons & alternatives](#comparisons-alternatives)
@@ -210,6 +211,22 @@ Per-role turn budgets are set in `src/aiteam/pipeline.py` (not env-configurable 
 | `src/aiteam/main.py` | CLI entry point: run/resume, per-turn checkpointing, transcript writing. |
 | `src/aiteam/config.py` | Unused: a provider-configurable AutoGen model client, kept for a possible future raw-API-key path (see [Configuration](#configuration)). |
 | `CLAUDE.md` | Instructions and invariants for AI coding agents working on this repo (activation-group deadlock gotcha, verdict-token matching rules, etc.) — read it before changing orchestration code. |
+| `tests/` | Orchestration tests against a scripted mock — see [Testing](#testing) below. |
+
+---
+
+## Testing
+
+Every live verification in [Evidence this works](#evidence-this-works-not-just-theory) was run against the real `claude` CLI — accurate, but slow and consuming real Claude Code session quota, which makes it a bad fit for routine regression testing. `tests/` covers the *orchestration* logic (GraphFlow routing, rework loops, hard-stop termination, checkpoint/resume) separately, against a scripted stand-in that returns canned text instead of calling `claude_agent_sdk` — deterministic, instant, and free.
+
+```sh
+PYTHONPATH=src:. .venv/bin/python -m unittest discover -s tests -t . -v
+```
+
+- `tests/mock_agent.py` — `ScriptedClaudeCodeAgent`, a `ClaudeCodeAgent` subclass that overrides only the SDK call; `save_state()`/`load_state()` and the rest of `BaseChatAgent` are inherited unchanged, so a passing test genuinely exercises the checkpoint/resume machinery, not a reimplementation of it. `build_team()` takes an `agent_cls` parameter for exactly this — production code (`main.py`) never passes it, so the real pipeline is unaffected.
+- `tests/test_pipeline.py` — five scenarios: the happy path (every role runs once), a QA rework loop that fails once then passes, three consecutive `QA_FAIL`s hitting the hard `PIPELINE_FAILED` stop, a UAT rejection loop, and checkpoint/resume recovering from a simulated crash.
+
+> **A real bug in the test's own design, caught before it shipped:** the checkpoint/resume test originally used `break` to simulate an interrupted run — stop consuming the message stream after `product_manager`'s turn, then save state. It failed: `resumed` sources came back as *all eight roles starting from `product_manager` again*. The cause wasn't a resume bug — `GraphFlow`'s runtime is a producer/consumer queue, and with near-instant scripted responses it kept processing in the background regardless of whether the test was still reading from the stream, racing the entire pipeline to completion before `save_state()` was ever called. The fix was a `CRASH` script sentinel that makes a turn genuinely raise an exception — the same thing that actually halts the runtime in production (the real Claude Code session-limit `RuntimeError`) — rather than a consumer merely pausing, which doesn't. Left as a comment in the test itself as a warning against the more "obvious" `break`-based version.
 
 ---
 
@@ -217,7 +234,9 @@ Per-role turn budgets are set in `src/aiteam/pipeline.py` (not env-configurable 
 
 ### Access per role
 
-Not every role gets the same tools, and the tools that are granted are further restricted by a permission guard — this isn't just an `allowed_tools` list, it's enforced at every tool call regardless of what's in that list (see below the table for why that distinction matters).
+Not every role gets the same tools, and the tools that are granted are further restricted by a permission guard, enforced at every tool call.
+
+> **A real bug this table used to be wrong about.** For most of this project's early life, tool restriction was set only via `allowed_tools=`. Live testing (prompted by "check for AI leak" — good instinct) found that `allowed_tools` doesn't restrict anything: per `claude_agent_sdk`'s own docs, it only skips the permission prompt for tools already available. A session built with `allowed_tools=["Read"]` and no further restriction could still run `Bash` — confirmed live. That means every role, including the four "pure reasoning" ones below, had Claude Code's full default toolset available the entire time, gated only by whether the prompt happened to ask for it. The fix: `ClaudeCodeAgent` now also sets `tools=`, the field that actually removes a tool from the model's context — confirmed live that a `tools=[]` agent genuinely cannot invoke any tool, and a QA-like agent with `Write`/`Edit` excluded from `tools` genuinely refuses a `Write` call. The table below now reflects what's actually enforced, not what `allowed_tools` alone implied.
 
 | Role | Tools | Write scope | Notes |
 |---|---|---|---|
@@ -228,7 +247,7 @@ Not every role gets the same tools, and the tools that are granted are further r
 | `frontend_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/frontend/` | Can install deps and self-verify (run its own build/tests) via Bash. |
 | `backend_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/backend/` | Same. |
 | `devops_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/` (root) | Needs root access to write Dockerfiles/compose/CI referencing `./frontend` and `./backend`. |
-| `qa_engineer` | `Read`, `Glob`, `Grep`, `Bash` — **no `Write`/`Edit`** | *(read-only)* | Can read and execute everything in the workspace to verify it, but cannot modify the code it's independently checking — a deliberate separation-of-duties choice, not an oversight (see [Why not just prompt Claude Code directly?](#why-not-just-prompt-claude-code-directly)). |
+| `qa_engineer` | `Read`, `Glob`, `Grep`, `Bash` — **no `Write`/`Edit`** | *(read-only, with a caveat)* | Genuinely cannot call `Write`/`Edit` now. But it still has `Bash`, and Bash can replicate file-writing (`echo ... > file`) — verified live: asked to write a file, it correctly refused `Write`, then *offered* to do the same thing via `Bash` instead. QA needs Bash for real test/build execution, so this isn't a bug to trivially fix — see the caveat below the table. |
 
 ### The permission guard
 
@@ -243,6 +262,7 @@ This was built the way it was for a specific, verified reason: the SDK's own `ca
 
 ### Other notes
 
+- **QA's read-only boundary is a tool restriction, not a Bash restriction.** Removing `Write`/`Edit` from `tools` genuinely blocks those two tools, but QA keeps `Bash` (it needs to run real builds/tests), and Bash can write files by other means (shell redirection, `sed -i`, etc.) that aren't on the `_BASH_DENY_PATTERNS` denylist — blocking generic redirection would also block QA's legitimate build/test output, so this wasn't tightened further. Treat "QA doesn't modify code" as a strong prompting-level expectation reinforced by removing the two most direct tools, not an airtight guarantee.
 - Treat `output/workspace/<timestamp>/` as untrusted-generated-code territory regardless of the guard above. It's written by an AI agent with real Bash access and no human review of individual commands.
 - No secrets should ever be required in code or config the agents write — `GLOBAL_RULES` in `prompts.py` mandates this, and BE/OPS prompts specifically forbid committed secrets, but this is enforced by prompting, not by a code-level guarantee.
 - `claude auth login` credentials are account-wide. Anyone who can run this pipeline can spend against your Claude Code plan.

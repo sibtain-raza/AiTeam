@@ -159,6 +159,14 @@ class ClaudeCodeAgent(BaseChatAgent):
         options = ClaudeAgentOptions(
             cwd=str(self._cwd),
             system_prompt=self._system_prompt,
+            # `tools` is what actually restricts which tools exist for this
+            # session (verified live: `allowed_tools` alone does NOT — it
+            # only skips the permission prompt for tools already available,
+            # so a session with `allowed_tools=["Read"]` and no `tools`
+            # restriction could still run Bash). Set both: `tools` gates
+            # availability, `allowed_tools` keeps the same set auto-approved
+            # so acceptEdits doesn't prompt for them.
+            tools=self._allowed_tools,
             allowed_tools=self._allowed_tools,
             permission_mode="acceptEdits",
             max_turns=self._max_turns,

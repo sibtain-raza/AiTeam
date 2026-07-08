@@ -41,7 +41,7 @@ def verdict_is(token: str):
     return check
 
 
-def build_team(workspace: Path) -> GraphFlow:
+def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAgent) -> GraphFlow:
     """Build the pipeline. Every agent runs via a real claude_agent_sdk
     session authenticated through the `claude` CLI's own OAuth login — no
     ANTHROPIC_API_KEY/OPENAI_API_KEY needed. See claude_code_agent.py.
@@ -50,6 +50,13 @@ def build_team(workspace: Path) -> GraphFlow:
     backend, but with `allowed_tools=[]` so they can't touch the filesystem.
     FE/BE/OPS/QA get real file/bash tools scoped to `workspace` (a per-run
     directory) so they actually write and verify code.
+
+    `agent_cls` defaults to the real `ClaudeCodeAgent` and is the seam
+    `tests/` uses to swap in `ScriptedClaudeCodeAgent` — a stand-in that
+    returns canned text instead of running a real Claude Code session, so
+    the graph/routing/checkpoint logic can be verified deterministically
+    and without spending Claude Code session quota. Production code never
+    passes this argument.
 
     Workspace layout (also encoded in prompts.py — keep the two in sync):
       workspace/frontend/   — frontend_engineer's cwd
@@ -70,7 +77,7 @@ def build_team(workspace: Path) -> GraphFlow:
         allowed_tools: Sequence[str] | None = None,
     ) -> ClaudeCodeAgent:
         kwargs = {} if allowed_tools is None else {"allowed_tools": allowed_tools}
-        return ClaudeCodeAgent(
+        return agent_cls(
             name=name,
             description=description,
             system_prompt=GLOBAL_RULES + "\n\n" + prompt,
