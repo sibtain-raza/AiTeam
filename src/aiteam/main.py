@@ -12,11 +12,11 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import BaseChatMessage
 from autogen_agentchat.teams import GraphFlow
 
 from .pipeline import ARTIFACT_DIR_NAME, build_team
+from .runner import FailFastMonitor, run_team
 
 
 async def _checkpoint(team: GraphFlow, checkpoint_path: Path, stamp: str, goal: str, workspace: Path) -> None:
@@ -32,12 +32,14 @@ async def _checkpoint(team: GraphFlow, checkpoint_path: Path, stamp: str, goal: 
 async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    monitor = FailFastMonitor()
+
     if resume is not None:
         checkpoint_data = json.loads(resume.read_text())
         stamp = checkpoint_data["stamp"]
         goal = checkpoint_data["goal"]
         workspace = Path(checkpoint_data["workspace"])
-        team = build_team(workspace)
+        team = build_team(workspace, on_event=monitor.on_event)
         await team.load_state(checkpoint_data["team_state"])
         task = None  # continue the previous task rather than starting a new one
         print(f"Resuming run {stamp} from {resume}\nWorkspace: {workspace}\n")
@@ -46,7 +48,7 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         workspace = output_dir / "workspace" / stamp
         workspace.mkdir(parents=True, exist_ok=True)
-        team = build_team(workspace)
+        team = build_team(workspace, on_event=monitor.on_event)
         task = goal
 
     checkpoint_path = output_dir / "checkpoints" / f"{stamp}.json"
@@ -55,35 +57,35 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
     if resume is None:
         transcript.write_text(f"# AiTeam run — {stamp}\n\nGOAL: {goal}\n\n---\n\n")
 
-    result: TaskResult | None = None
+    async def on_message(message: BaseChatMessage) -> None:
+        print(f"\n---------- {message.source} ----------\n{message.to_text()}")
+        with transcript.open("a") as f:
+            f.write(f"## {message.source}\n\n{message.to_text()}\n\n---\n\n")
+        # Persist the latest artifact per source to disk. This is what
+        # the pointer_files mechanism (see pipeline.py / ClaudeCodeAgent)
+        # points agents at on rework turns instead of replaying the
+        # full text — overwriting keeps exactly one file per source,
+        # always the current version.
+        artifact_dir = workspace / ARTIFACT_DIR_NAME
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / f"{message.source}.md").write_text(message.to_text())
+        # Checkpoint after every completed agent turn, so a failure
+        # (crash, hitting the Claude Code session limit, etc.) only
+        # loses the turn in flight — not the whole run.
+        await _checkpoint(team, checkpoint_path, stamp, goal, workspace)
+
     try:
-        async for message in team.run_stream(task=task):
-            if isinstance(message, TaskResult):
-                result = message
-                continue
-            if isinstance(message, BaseChatMessage):
-                print(f"\n---------- {message.source} ----------\n{message.to_text()}")
-                with transcript.open("a") as f:
-                    f.write(f"## {message.source}\n\n{message.to_text()}\n\n---\n\n")
-                # Persist the latest artifact per source to disk. This is what
-                # the pointer_files mechanism (see pipeline.py / ClaudeCodeAgent)
-                # points agents at on rework turns instead of replaying the
-                # full text — overwriting keeps exactly one file per source,
-                # always the current version.
-                artifact_dir = workspace / ARTIFACT_DIR_NAME
-                artifact_dir.mkdir(parents=True, exist_ok=True)
-                (artifact_dir / f"{message.source}.md").write_text(message.to_text())
-                # Checkpoint after every completed agent turn, so a failure
-                # (crash, hitting the Claude Code session limit, etc.) only
-                # loses the turn in flight — not the whole run.
-                await _checkpoint(team, checkpoint_path, stamp, goal, workspace)
+        # run_team stops the whole run the instant any single agent
+        # reports a failure (see runner.py) — it does not wait for the
+        # other engineers to also finish or fail on their own.
+        stop_reason = await run_team(team, task, on_message, monitor)
     except Exception as exc:
         print(f"\nRun failed: {exc}")
         print(f"Progress checkpointed to {checkpoint_path} — resume with:")
         print(f'  PYTHONPATH=src python -m aiteam.main --resume "{checkpoint_path}"')
         raise
 
-    print(f"\nStop reason: {result.stop_reason if result else 'unknown'}")
+    print(f"\nStop reason: {stop_reason}")
     print(f"Transcript saved to {transcript}")
     print(f"Workspace (real files written by FE/BE/OPS/QA): {workspace}")
 

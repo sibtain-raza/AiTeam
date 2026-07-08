@@ -10,7 +10,7 @@ the workspace-directory convention this pairs with in pipeline.py.
 import os
 import re
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from autogen_agentchat.agents import BaseChatAgent
 from autogen_agentchat.base import Response
@@ -22,10 +22,29 @@ from claude_agent_sdk import (
     HookMatcher,
     ResultMessage,
     TextBlock,
+    ToolUseBlock,
     query,
 )
 
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+
+# (source_name, event_type, detail, extra) -> None. Fired at turn start,
+# per tool call, and turn end. Optional and best-effort: main.py's CLI path
+# never sets this (nothing to consume the events), a web/UI runner does.
+OnEvent = Callable[[str, str, str, dict[str, Any]], Awaitable[None]]
+
+
+def _summarize_tool_call(name: str, tool_input: dict[str, Any]) -> str:
+    """One-line human-readable summary of a tool call for a live activity
+    feed — e.g. "docker build ./backend", not the raw JSON input (which for
+    Write/Edit would be the entire file being written)."""
+    if name == "Bash":
+        return str(tool_input.get("command", ""))[:200]
+    if name in ("Write", "Edit", "Read"):
+        return str(tool_input.get("file_path", ""))
+    if name in ("Glob", "Grep"):
+        return str(tool_input.get("pattern", ""))
+    return str(tool_input)[:200]
 
 # Best-effort content policy applied to every tool-using role, regardless of
 # which specific tools that role has. This is NOT a sandbox — it's a
@@ -151,6 +170,7 @@ class ClaudeCodeAgent(BaseChatAgent):
         allowed_tools: Sequence[str] = DEFAULT_ALLOWED_TOOLS,
         context_sources: Mapping[str, str] | None = None,
         pointer_files: Mapping[str, Path] | None = None,
+        on_event: OnEvent | None = None,
     ) -> None:
         super().__init__(name, description=description)
         self._system_prompt = system_prompt
@@ -162,6 +182,15 @@ class ClaudeCodeAgent(BaseChatAgent):
         self._hooks = _make_hooks(cwd)
         self._context_sources = dict(context_sources) if context_sources is not None else None
         self._pointer_files = dict(pointer_files) if pointer_files is not None else None
+        self._on_event = on_event
+
+    async def _emit(self, event_type: str, detail: str = "", **extra: Any) -> None:
+        if self._on_event is None:
+            return
+        try:
+            await self._on_event(self.name, event_type, detail, extra)
+        except Exception:
+            pass  # a live-status sink must never break an actual pipeline turn
 
     def _build_prompt(self, new_sources: set[str] | None = None) -> str:
         """Render the (filtered) history as the session prompt.
@@ -224,6 +253,7 @@ class ClaudeCodeAgent(BaseChatAgent):
     ) -> Response:
         self._history.extend(messages)
         prompt = self._build_prompt(new_sources={msg.source for msg in messages})
+        await self._emit("turn_started")
 
         self._cwd.mkdir(parents=True, exist_ok=True)
         options = ClaudeAgentOptions(
@@ -246,18 +276,30 @@ class ClaudeCodeAgent(BaseChatAgent):
 
         transcript: list[str] = []
         result_text = ""
+        cost_usd: float | None = None
+        duration_ms: int | None = None
         async for msg in query(prompt=prompt, options=options):
             if isinstance(msg, AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         transcript.append(block.text)
+                    elif isinstance(block, ToolUseBlock):
+                        await self._emit(
+                            "tool_call",
+                            _summarize_tool_call(block.name, block.input),
+                            tool_name=block.name,
+                        )
             elif isinstance(msg, ResultMessage):
                 if msg.is_error:
+                    await self._emit("error", msg.result or str(msg.errors))
                     raise RuntimeError(
                         f"{self.name}: Claude Code session failed "
                         f"({msg.subtype}): {msg.result or msg.errors}"
                     )
                 result_text = msg.result or ""
+                cost_usd = msg.total_cost_usd
+                duration_ms = msg.duration_ms
 
         final_text = result_text or "\n".join(transcript) or "(no output produced)"
+        await self._emit("turn_completed", final_text, cost_usd=cost_usd, duration_ms=duration_ms)
         return Response(chat_message=TextMessage(content=final_text, source=self.name))

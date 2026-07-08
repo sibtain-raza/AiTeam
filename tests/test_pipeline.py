@@ -9,6 +9,7 @@ that was verified (live, against real Claude Code sessions).
 Run with:  PYTHONPATH=src:. .venv/bin/python -m unittest discover -s tests -v
 """
 
+import asyncio
 import shutil
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import BaseChatMessage
 
 from aiteam.pipeline import build_team
+from aiteam.runner import AgentFailure, FailFastMonitor, run_team
 
 from .mock_agent import CRASH, ScriptedClaudeCodeAgent, set_script
 
@@ -177,6 +179,39 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(resumed[0], "solution_architect", "resume should retry the crashed turn")
         self.assertIn("release_reporter", resumed)
+
+    async def test_fail_fast_stops_the_run_when_one_of_several_parallel_engineers_crashes(self) -> None:
+        """frontend_engineer, backend_engineer, and devops_engineer all run
+        concurrently off the same architect fan-out. Live testing against
+        the real pipeline found that when exactly one of them crashes (hit
+        the turn cap) while the others are still mid-turn, the installed
+        AutoGen version does NOT cleanly raise that failure out of
+        `team.run_stream()` — it degrades into an unhandled internal
+        message-routing error in a background asyncio task, and the run
+        sits reporting "running" forever (see runner.py's module docstring
+        and CLAUDE.md). This is the regression test for the fix: `run_team`
+        must detect the crash via the on_event hook (independent of
+        GraphFlow's own propagation) and raise AgentFailure promptly rather
+        than hang — `asyncio.wait_for` below turns a reintroduced hang into
+        a fast, clear test failure instead of a stuck test run.
+        """
+        set_script(
+            {
+                **BASE_SCRIPT,
+                "frontend_engineer": [CRASH],
+                "qa_engineer": [QA_PASS_TEXT],
+                "uat_reviewer": [UAT_APPROVED_TEXT],
+            }
+        )
+        monitor = FailFastMonitor()
+        team = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent, on_event=monitor.on_event)
+
+        async def on_message(_message: BaseChatMessage) -> None:
+            pass
+
+        with self.assertRaises(AgentFailure) as ctx:
+            await asyncio.wait_for(run_team(team, "Build a thing.", on_message, monitor), timeout=10)
+        self.assertEqual(ctx.exception.source, "frontend_engineer")
 
 
 if __name__ == "__main__":

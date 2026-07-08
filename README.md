@@ -28,6 +28,7 @@ Want to just run it? Jump to [Getting started](#getting-started).
 - [Evidence this works](#evidence-this-works-not-just-theory)
 - [Checkpoint & resume](#checkpoint-resume)
 - [Getting started](#getting-started)
+- [Web UI](#web-ui)
 - [Project layout](#project-layout)
 - [Testing](#testing)
 - [Security & access control](#security-access-control)
@@ -203,6 +204,43 @@ Per-role turn budgets are set in `src/aiteam/pipeline.py` (not env-configurable 
 
 ---
 
+## Web UI
+
+Everything above also runs from a browser instead of a terminal: sign up, submit a goal, and watch all eight agents work in real time on a schematic of the actual pipeline graph — no `PYTHONPATH`, no tailing a transcript file. It's a control plane on top of the same `build_team()` the CLI uses, not a different or cheaper execution path: a run started from the web UI spends exactly the same real Claude Code session quota as one started from `main.py`.
+
+```sh
+# Terminal 1 — backend (FastAPI)
+PYTHONPATH=src:. .venv/bin/uvicorn server.app:app --reload --port 8000
+
+# Terminal 2 — frontend (React + Vite)
+cd web && npm install && npm run dev
+```
+
+Open `http://localhost:5173`, create an account, and start a run.
+
+### How it's wired
+
+- **`server/`** (FastAPI) is a thin control plane around the pipeline, not a reimplementation of it. `server/pipeline_runner.py` calls the same `build_team()` from `src/aiteam/pipeline.py`, passing an `on_event` callback that `ClaudeCodeAgent` fires on `turn_started`/`tool_call`/`turn_completed`/`error` (added to `claude_code_agent.py` for exactly this). Each event is written to SQLite (`Run`, `RunEvent` in `server/models.py`) and published to an in-process pub/sub broker (`server/events.py`). `GET /runs/{id}/events` is a Server-Sent Events endpoint the frontend subscribes to — it replays an SSE-safe JSON view of a run's event history on connect, then streams live events until the run finishes.
+- **`web/`** (React + Vite + TypeScript) has three pages: sign in/up, a run list with a "start a new run" form, and the Run Floor — a fixed-layout schematic mirroring `pipeline.py`'s actual graph shape (the PM → Architect → {FE, BE, OPS} → QA → UAT → Reporter spine, with the `QA_FAIL` rework loop and `UAT_REJECTED` re-scope loop drawn as their own channels), plus a terminal-style activity log, both driven live by the SSE stream.
+- Auth is a normal JWT (signup/login issue a bearer token). The one deliberate deviation: `/runs/{id}/events` accepts the token as a `?token=` query parameter instead of an `Authorization` header, because a browser's native `EventSource` can't set custom headers — a known, documented tradeoff (URL-borne tokens can leak into logs/browser history) that's fine for a local/trusted deployment and worth revisiting before anything public-facing.
+- The pipeline's own on-disk state — the per-run workspace and `output/checkpoints/<stamp>.json` — is still the real source of truth for a run's code and for resuming it; the web UI's SQLite database only tracks *who owns which run* and *the live event feed*, and does not replace or duplicate that state.
+
+### A bug this surfaced, and the regression test it earned
+
+Building the live event stream is what caught a genuine race condition, not a hypothetical one: the first version of `GET /runs/{id}/events` took its DB history snapshot *before* subscribing to the live broker. Any event published in that exact gap was lost forever — absent from the snapshot (already queried) and missed by the live subscription (not yet open). Live-tested against a real running server, this reliably dropped `product_manager`'s events entirely, because the scripted-agent turn completed faster than the network round-trip needed to open the SSE connection — a real browser hitting a fast-completing turn against a real `claude` session could hit the same window. Fixed by subscribing to the broker *first*, then taking the snapshot, then deduping by each event's monotonic `seq` so the same event is never delivered twice. `tests/test_server_e2e.py` now asserts `product_manager` is present and that `seq` is gap-free and duplicate-free specifically to guard against this regressing.
+
+### Phase 1 — deliberate simplifications, not oversights
+
+Named explicitly so they're not mistaken for the finished state:
+
+- **Shared Claude Code login.** Every user of the web app spends against the *same host's* `claude auth login` session — there is no per-user Claude billing or quota isolation. Fine for one person or a trusted team on one machine; wrong for a multi-tenant deployment.
+- **SQLite + in-process pub/sub, single process only.** `server/db.py` defaults to a local SQLite file; `server/events.py`'s broker is an in-memory `dict` of queues. Both are documented in-file as single-process-only — a multi-worker deployment would need Postgres and a real message bus (e.g. Redis pub/sub) instead.
+- **No refresh-token rotation.** JWTs are long-lived (7 days, `server/auth.py`) with no revocation mechanism.
+- **`AITEAM_JWT_SECRET` defaults to an insecure value** with a startup warning printed to the console — set a real secret via env var before running this anywhere but localhost.
+- **No resume-from-the-UI yet.** A run that fails mid-flight still leaves a valid checkpoint (see [Checkpoint & resume](#checkpoint-resume)), but re-running it today means going back to `main.py --resume` from a terminal — wiring that into a "Resume" button in the run list is a natural next step, not something ruled out.
+
+---
+
 ## Project layout
 
 | File | What's there |
@@ -216,6 +254,8 @@ Per-role turn budgets are set in `src/aiteam/pipeline.py` (not env-configurable 
 | `src/aiteam/config.py` | Unused: a provider-configurable AutoGen model client, kept for a possible future raw-API-key path (see [Configuration](#configuration)). |
 | `CLAUDE.md` | Instructions and invariants for AI coding agents working on this repo (activation-group deadlock gotcha, verdict-token matching rules, etc.) — read it before changing orchestration code. |
 | `tests/` | Orchestration tests against a scripted mock — see [Testing](#testing) below. |
+| `server/` | FastAPI control-plane API for the [Web UI](#web-ui) — auth, run creation, SSE event streaming. Calls `build_team()` from `pipeline.py`; doesn't reimplement it. |
+| `web/` | React + Vite + TypeScript frontend for the [Web UI](#web-ui) — auth pages, run list, and the live Run Floor schematic. |
 
 ---
 
@@ -227,8 +267,9 @@ Every live verification in [Evidence this works](#evidence-this-works-not-just-t
 PYTHONPATH=src:. .venv/bin/python -m unittest discover -s tests -t . -v
 ```
 
-- `tests/mock_agent.py` — `ScriptedClaudeCodeAgent`, a `ClaudeCodeAgent` subclass that overrides only the SDK call; `save_state()`/`load_state()` and the rest of `BaseChatAgent` are inherited unchanged, so a passing test genuinely exercises the checkpoint/resume machinery, not a reimplementation of it. `build_team()` takes an `agent_cls` parameter for exactly this — production code (`main.py`) never passes it, so the real pipeline is unaffected.
+- `tests/mock_agent.py` — `ScriptedClaudeCodeAgent`, a `ClaudeCodeAgent` subclass that overrides only the SDK call; `save_state()`/`load_state()` and the rest of `BaseChatAgent` are inherited unchanged, so a passing test genuinely exercises the checkpoint/resume machinery, not a reimplementation of it. `build_team()` takes an `agent_cls` parameter for exactly this — production code (`main.py`) never passes it, so the real pipeline is unaffected. It also drives the same `on_event` hook the real agent does, so the [Web UI](#web-ui)'s live event stream is testable without spending Claude Code quota either.
 - `tests/test_pipeline.py` — five scenarios: the happy path (every role runs once), a QA rework loop that fails once then passes, three consecutive `QA_FAIL`s hitting the hard `PIPELINE_FAILED` stop, a UAT rejection loop, and checkpoint/resume recovering from a simulated crash.
+- `tests/test_server_e2e.py` — the [Web UI](#web-ui) backend end to end against the scripted agent: signup, duplicate-signup rejection, unauthenticated-request rejection, run creation, the SSE event stream (asserting every one of the 8 roles is present and `seq` is gap-free/duplicate-free), final run status, and reconnect-after-completion. This is the regression test for the history/subscribe race bug described in [Web UI](#web-ui).
 
 > **A real bug in the test's own design, caught before it shipped:** the checkpoint/resume test originally used `break` to simulate an interrupted run — stop consuming the message stream after `product_manager`'s turn, then save state. It failed: `resumed` sources came back as *all eight roles starting from `product_manager` again*. The cause wasn't a resume bug — `GraphFlow`'s runtime is a producer/consumer queue, and with near-instant scripted responses it kept processing in the background regardless of whether the test was still reading from the stream, racing the entire pipeline to completion before `save_state()` was ever called. The fix was a `CRASH` script sentinel that makes a turn genuinely raise an exception — the same thing that actually halts the runtime in production (the real Claude Code session-limit `RuntimeError`) — rather than a consumer merely pausing, which doesn't. Left as a comment in the test itself as a warning against the more "obvious" `break`-based version.
 

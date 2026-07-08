@@ -55,16 +55,27 @@ def call_count(name: str) -> int:
 class ScriptedClaudeCodeAgent(ClaudeCodeAgent):
     """Drop-in ClaudeCodeAgent replacement: on_messages() returns the next
     scripted response for this agent's name instead of calling claude_agent_sdk.
+
+    Still calls the inherited `_emit()` at the same two turn-boundary points
+    the real class does (turn_started / turn_completed / error) — so a test
+    that wires `on_event` through `build_team()` exercises the actual event
+    plumbing (server/pipeline_runner.py's DB persistence + SSE broadcast),
+    not just routing. `_emit()` is a no-op when `on_event` isn't set, which
+    is true for every existing routing/rework-loop test — this is additive,
+    not a behavior change for them.
     """
 
     async def on_messages(
         self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
     ) -> Response:
         self._history.extend(messages)
+        await self._emit("turn_started")
         responses = _scripts.get(self.name, ["(no script configured for this agent)"])
         idx = min(_call_counts[self.name], len(responses) - 1)
         _call_counts[self.name] += 1
         entry = responses[idx]
         if isinstance(entry, _Crash):
+            await self._emit("error", "simulated crash (scripted)")
             raise RuntimeError(f"{self.name}: simulated crash (scripted)")
+        await self._emit("turn_completed", entry, cost_usd=0.0, duration_ms=0)
         return Response(chat_message=TextMessage(content=entry, source=self.name))

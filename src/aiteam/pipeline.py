@@ -7,7 +7,7 @@ from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_agentchat.messages import BaseChatMessage
 from autogen_agentchat.teams import DiGraphBuilder, GraphFlow
 
-from .claude_code_agent import ClaudeCodeAgent
+from .claude_code_agent import ClaudeCodeAgent, OnEvent
 from .prompts import (
     ARCHITECT_PROMPT,
     BE_PROMPT,
@@ -48,7 +48,11 @@ def verdict_is(token: str):
     return check
 
 
-def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAgent) -> GraphFlow:
+def build_team(
+    workspace: Path,
+    agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAgent,
+    on_event: OnEvent | None = None,
+) -> GraphFlow:
     """Build the pipeline. Every agent runs via a real claude_agent_sdk
     session authenticated through the `claude` CLI's own OAuth login — no
     ANTHROPIC_API_KEY/OPENAI_API_KEY needed. See claude_code_agent.py.
@@ -62,8 +66,15 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
     `tests/` uses to swap in `ScriptedClaudeCodeAgent` — a stand-in that
     returns canned text instead of running a real Claude Code session, so
     the graph/routing/checkpoint logic can be verified deterministically
-    and without spending Claude Code session quota. Production code never
-    passes this argument.
+    and without spending Claude Code session quota. The CLI (`main.py`)
+    never passes this argument.
+
+    `on_event`, if given, is wired into every tool-using and reasoning
+    agent's `ClaudeCodeAgent._emit()` (see claude_code_agent.py) — fired on
+    turn start, each tool call, and turn completion. This is what the web
+    server's live "run floor" view subscribes to; the CLI leaves it unset
+    and simply doesn't get per-tool-call granularity (it already prints
+    each completed turn's full text once GraphFlow yields it).
 
     Workspace layout (also encoded in prompts.py — keep the two in sync):
       workspace/frontend/   — frontend_engineer's cwd
@@ -94,6 +105,7 @@ def build_team(workspace: Path, agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAge
             max_turns=max_turns,
             context_sources=context_sources,
             pointer_files=pointer_files,
+            on_event=on_event,
             **kwargs,
         )
 

@@ -1,3 +1,11 @@
 autogen-agentchat>=0.7.5
 autogen-ext[openai,anthropic]>=0.7.5
 claude-agent-sdk>=0.2.111
+
+# Web UI backend (server/) — see README "Web UI"
+fastapi>=0.139.0
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+python-jose[cryptography]>=3.5
+bcrypt>=5.0
+python-multipart>=0.0.9
