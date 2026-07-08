@@ -133,6 +133,9 @@ def build_team(workspace: Path) -> GraphFlow:
         QA_PROMPT,
         cwd=workspace,
         max_turns=QA_MAX_TURNS,
+        # No Write/Edit: QA verifies and reports defects, it never modifies
+        # the code it's independently checking — see README "Access per role".
+        allowed_tools=["Read", "Glob", "Grep", "Bash"],
     )
     uat = code_agent(
         "uat_reviewer",

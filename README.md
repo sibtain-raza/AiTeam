@@ -217,7 +217,35 @@ Where the skeptic is right:
 
 ## Security notes
 
-- Treat `output/workspace/<timestamp>/` as untrusted-generated-code territory. It's written by an AI agent with real Bash access and no human review of individual commands.
+### Access per role
+
+Not every role gets the same tools, and the tools that are granted are further restricted by a permission guard — this isn't just an `allowed_tools` list, it's enforced at every tool call regardless of what's in that list (see below the table for why that distinction matters).
+
+| Role | Tools | Write scope | Notes |
+|---|---|---|---|
+| `product_manager` | *(none)* | — | Pure text reasoning. Cannot touch the filesystem or run anything. |
+| `solution_architect` | *(none)* | — | Same. |
+| `uat_reviewer` | *(none)* | — | Same — deliberately judges the *original goal* against summaries, not the code. |
+| `release_reporter` | *(none)* | — | Same — summarizes the record, doesn't re-inspect anything. |
+| `frontend_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/frontend/` | Can install deps and self-verify (run its own build/tests) via Bash. |
+| `backend_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/backend/` | Same. |
+| `devops_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/` (root) | Needs root access to write Dockerfiles/compose/CI referencing `./frontend` and `./backend`. |
+| `qa_engineer` | `Read`, `Glob`, `Grep`, `Bash` — **no `Write`/`Edit`** | *(read-only)* | Can read and execute everything in the workspace to verify it, but cannot modify the code it's independently checking — this is a deliberate separation-of-duties choice, not an oversight (see [Why not just prompt Claude Code directly?](#why-not-just-prompt-claude-code-directly)). |
+
+### The permission guard
+
+Every tool-using role (FE/BE/OPS/QA) runs with a `PreToolUse` hook (`_make_hooks` in `claude_code_agent.py`) that fires on *every* tool call before it executes, independent of what's in `allowed_tools`:
+
+- **`Write`/`Edit`** calls targeting a path that resolves outside that agent's own workspace directory are denied — precise path resolution (handles both `..` traversal and absolute paths), not a string match.
+- **`Bash`** commands matching a short denylist (`rm -rf`/`rm -fr`, `sudo`, `curl`, `wget`, `git push`, `chmod -R 777`, `mkfs`, `dd if=`, `shutdown`, `reboot`) are denied.
+
+This was built the way it was for a specific, verified reason: the SDK's own `can_use_tool` callback looked like the obvious mechanism for this, but a live test showed a real `curl` call sail straight through it — `allowed_tools` entries that grant a whole tool (e.g. plain `"Bash"`) auto-approve every call before `can_use_tool` is ever consulted (`CanUseToolShadowedWarning`). `PreToolUse` hooks don't have that shadowing problem, which is why the guard is built on hooks, not `can_use_tool`. Both the deny paths and the legitimate-call paths were verified live, not just unit-tested: a real session had its `curl` blocked, and a separate real session successfully wrote a file and ran a safe command — and when that same session first tried to write outside its workspace, it was denied, read the reason, and correctly retried inside its own directory instead of failing.
+
+**What this is not:** a sandbox. It's a string-match denylist on the literal Bash command and a path-resolution check on Write/Edit — both enforced in this process, not by the OS. A sufficiently adversarial command can likely evade the denylist (e.g. an alternate spelling of a blocked binary, or a destructive action the list doesn't happen to name). Real OS-level filesystem/network confinement is `claude_agent_sdk`'s `SandboxSettings` (macOS/Linux), which isn't wired in yet — see [Possible future work](#possible-future-work).
+
+### Other notes
+
+- Treat `output/workspace/<timestamp>/` as untrusted-generated-code territory regardless of the guard above. It's written by an AI agent with real Bash access and no human review of individual commands.
 - No secrets should ever be required in code or config the agents write — `GLOBAL_RULES` in `prompts.py` mandates this, and BE/OPS prompts specifically forbid committed secrets, but this is enforced by prompting, not by a code-level guarantee.
 - `claude auth login` credentials are account-wide. Anyone who can run this pipeline can spend against your Claude Code plan.
 
