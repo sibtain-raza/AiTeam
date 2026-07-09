@@ -118,6 +118,15 @@ This convention is encoded directly into the FE/BE/OPS/QA prompts (`src/aiteam/p
 > **Why route everything through the `claude` CLI instead of a raw API key?**
 > Simplicity of one auth path — the reasoning roles and the execution roles use the exact same underlying primitive (`claude_agent_sdk.query()`), just configured differently (tools on/off). The tradeoff is real: this is a genuine single-vendor dependency, not a neutral choice — see [Honest limitations](#honest-limitations-and-tradeoffs).
 
+### What happens when an engineer runs out of turns
+
+Every engineering turn has a budget (see [Configuration](#configuration) — dynamically sized by the architect, not a fixed number). Running out is **not** the same as rejection, and it's worth being precise about what actually happens, since the two are easy to conflate:
+
+- **Work already done is never thrown away.** `ClaudeCodeAgent` writes files to the workspace *as it goes*, via real `Write`/`Edit` tool calls — not as one bundled result returned only at the end. Hitting the turn limit cuts off the *conversation*, not the filesystem. If an engineer planned 6 files and got cut off after 3, those 3 files exist; files 4–6 simply were never attempted. The loss is the unattempted remainder, not the completed portion.
+- **QA evaluates the real files on disk, not the chat message**, so an incomplete implementation surfaces the normal way: QA's own rule is explicit — *"An AC/NFR with no implementing code is an automatic failure."* A turn that ran out of budget doesn't get special-cased; it's judged exactly like a genuine bug would be.
+- **The "penalty," such as it is, is the existing QA rework loop — not a separate mechanism.** `QA_FAIL` routes back to the owning engineer(s) with a **fresh full turn budget**, not a reduced one, and the engineer resumes from the files it already wrote rather than starting over. This is closer to a real team's code-review-and-fix cycle than a rejection.
+- **It's bounded, the same way a real team's patience is.** Only 3 `QA_FAIL` loops are allowed (`MAX_QA_LOOPS`) before the whole run hard-stops with `PIPELINE_FAILED` — repeatedly running out of turns doesn't get infinite extra attempts.
+
 ---
 
 ## Evidence this works (not just theory)
