@@ -1,7 +1,8 @@
 """GraphFlow pipeline: PM → Architect → (FE ∥ BE ∥ OPS) → QA → UAT, with rework loops."""
 
+import re
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_agentchat.messages import BaseChatMessage
@@ -33,6 +34,60 @@ MAX_MESSAGES = 40
 # Dockerfile/.dockerignore conventions treat it as metadata, not app code.
 ARTIFACT_DIR_NAME = ".pipeline-docs"
 
+# Bounds for the architect's per-engineer turn-budget estimate (see
+# ARCHITECT_PROMPT's "Turn Budget Estimate" section and
+# apply_turn_budget_from_architect() below). Clamping protects both ends:
+# a too-low estimate would reproduce the exact bug this mechanism exists to
+# fix (an engineer starved of turns on a real task), and a too-high one
+# would let one miscalibrated estimate blow the run's cost far past what
+# the fixed ENGINEER_MAX_TURNS default used to risk.
+MIN_ENGINEER_TURNS = 8
+MAX_ENGINEER_TURNS = 50
+
+_TURN_BUDGET_LINE = re.compile(r"^\s*(FE|BE|OPS)\s*:\s*(\d+)", re.MULTILINE)
+_TURN_BUDGET_ROLE_TO_AGENT = {"FE": "frontend_engineer", "BE": "backend_engineer", "OPS": "devops_engineer"}
+
+
+def parse_turn_budget(text: str) -> dict[str, int]:
+    """Extract the architect's per-role turn estimates from its TECH
+    DESIGN's "## Turn Budget Estimate" section (format one line per role:
+    "FE: <N> — <reason>"). Each parsed value is clamped into
+    [MIN_ENGINEER_TURNS, MAX_ENGINEER_TURNS]. A role that's missing or
+    didn't parse is simply absent from the result — the caller keeps
+    whatever budget that engineer already has (the static ENGINEER_MAX_TURNS
+    default from build_team(), unless a prior turn already set one).
+    """
+    budget: dict[str, int] = {}
+    for role, value in _TURN_BUDGET_LINE.findall(text):
+        budget[role] = max(MIN_ENGINEER_TURNS, min(MAX_ENGINEER_TURNS, int(value)))
+    return budget
+
+
+def apply_turn_budget_from_architect(
+    message: BaseChatMessage, agents: Mapping[str, ClaudeCodeAgent]
+) -> dict[str, int]:
+    """If `message` is solution_architect's TECH DESIGN, parse its turn
+    budget estimate and apply it to the FE/BE/OPS agent objects via
+    `ClaudeCodeAgent.set_max_turns()` — raising or lowering their ceiling
+    from the static default set at `build_team()` time to a task-specific
+    one, now that the architect has actually scoped the work. Returns the
+    budget that was applied (empty if `message` wasn't from the architect,
+    or nothing parsed) so a caller can log/emit it. No-ops for a role
+    missing from `agents` (e.g. a test team that only wired a subset).
+
+    Shared by `main.py` and `server/pipeline_runner.py` — both `on_message`
+    callbacks need this identical behavior, so it lives here once rather
+    than being reimplemented per entry point.
+    """
+    if message.source != "solution_architect":
+        return {}
+    budget = parse_turn_budget(message.to_text())
+    for role, n in budget.items():
+        agent = agents.get(_TURN_BUDGET_ROLE_TO_AGENT[role])
+        if agent is not None:
+            agent.set_max_turns(n)
+    return budget
+
 
 def verdict_is(token: str):
     """Edge condition: the source agent's final non-empty line is exactly `token`.
@@ -52,10 +107,17 @@ def build_team(
     workspace: Path,
     agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAgent,
     on_event: OnEvent | None = None,
-) -> GraphFlow:
+) -> tuple[GraphFlow, dict[str, ClaudeCodeAgent]]:
     """Build the pipeline. Every agent runs via a real claude_agent_sdk
     session authenticated through the `claude` CLI's own OAuth login — no
     ANTHROPIC_API_KEY/OPENAI_API_KEY needed. See claude_code_agent.py.
+
+    Returns `(team, agents)` — `agents` maps each role name to its actual
+    `ClaudeCodeAgent` object, since `GraphFlow` itself exposes no public way
+    to look up a participant after construction. This is what
+    `apply_turn_budget_from_architect()` (above) uses to call
+    `set_max_turns()` on FE/BE/OPS once the architect's estimate exists;
+    callers that don't need it can just ignore the second element.
 
     PM/Architect/UAT/Reporter are pure reasoning roles: same execution
     backend, but with `allowed_tools=[]` so they can't touch the filesystem.
@@ -301,8 +363,19 @@ def build_team(
         | MaxMessageTermination(MAX_MESSAGES)
     )
 
-    return GraphFlow(
+    team = GraphFlow(
         participants=builder.get_participants(),
         graph=graph,
         termination_condition=termination,
     )
+    agents = {
+        "product_manager": pm,
+        "solution_architect": architect,
+        "frontend_engineer": fe,
+        "backend_engineer": be,
+        "devops_engineer": ops,
+        "qa_engineer": qa,
+        "uat_reviewer": uat,
+        "release_reporter": reporter,
+    }
+    return team, agents

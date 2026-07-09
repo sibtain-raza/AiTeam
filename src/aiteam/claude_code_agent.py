@@ -26,7 +26,33 @@ from claude_agent_sdk import (
     query,
 )
 
+from .termination import last_line
+
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+
+# QA/UAT MUST end their message in one of these tokens for GraphFlow's
+# conditional edges (verdict_is() in pipeline.py) to route anywhere — no
+# match means no outgoing edge fires and that branch of the graph stalls.
+# A turn that hits error_max_turns (or, in principle, any other reason the
+# model doesn't produce a clean final line) is force-completed with the
+# conservative fallback: never silently PASS/APPROVE work that was cut off
+# before it was actually verified.
+_VALID_VERDICTS = {
+    "qa_engineer": {"QA_PASS", "QA_FAIL"},
+    "uat_reviewer": {"UAT_APPROVED", "UAT_REJECTED"},
+}
+_FALLBACK_VERDICT = {"qa_engineer": "QA_FAIL", "uat_reviewer": "UAT_REJECTED"}
+
+# Sonnet, not Claude Code's own default (typically Opus-tier), for every
+# agent unless AITEAM_CODE_MODEL overrides it. This pipeline runs many real
+# agentic sessions per goal (8 base turns, more with QA rework loops), all
+# drawing the same Claude Code session/usage quota as interactive use —
+# Sonnet is materially cheaper/faster per session with no code change
+# required elsewhere. "sonnet" (not a dated model string) is a CLI alias
+# that always resolves to the latest Sonnet model — confirmed via
+# `claude --help`: "Provide an alias for the latest model (e.g. 'sonnet' or
+# 'opus') or a model's full name."
+DEFAULT_MODEL = "sonnet"
 
 # (source_name, event_type, detail, extra) -> None. Fired at turn start,
 # per tool call, and turn end. Optional and best-effort: main.py's CLI path
@@ -178,11 +204,39 @@ class ClaudeCodeAgent(BaseChatAgent):
         self._max_turns = max_turns
         self._allowed_tools = list(allowed_tools)
         self._history: list[BaseChatMessage] = []
-        self._model = os.environ.get("AITEAM_CODE_MODEL")
+        self._model = os.environ.get("AITEAM_CODE_MODEL", DEFAULT_MODEL)
         self._hooks = _make_hooks(cwd)
         self._context_sources = dict(context_sources) if context_sources is not None else None
         self._pointer_files = dict(pointer_files) if pointer_files is not None else None
         self._on_event = on_event
+
+    def set_max_turns(self, max_turns: int) -> None:
+        """Override the turn budget set at construction time — the seam
+        `pipeline.py`'s dynamic turn-budget mechanism uses to raise or
+        lower an engineer's ceiling based on the architect's own per-role
+        estimate in the TECH DESIGN, once that estimate exists (it can't be
+        known at `build_team()` time, before the architect has run). Public
+        on purpose, unlike `_max_turns` itself — reaching into a "private"
+        attribute from outside the class would work today but isn't an
+        interface anyone should build on.
+        """
+        self._max_turns = max_turns
+
+    def find_message_from(self, source: str) -> BaseChatMessage | None:
+        """Most recent message from `source` in this agent's replayed
+        history, or None. `set_max_turns()` overrides aren't captured by
+        `save_state()`/`load_state()` (only `_history` is), so a freshly
+        -rebuilt agent on `--resume` reverts to the static default unless
+        the caller re-derives the dynamic budget itself — the architect's
+        own TECH DESIGN message is still in an engineer's history (every
+        engineer's `context_sources` includes `solution_architect`), so
+        re-parsing it from here reconstructs the same budget
+        deterministically. See `pipeline.py`'s resume handling in `main.py`.
+        """
+        for msg in reversed(self._history):
+            if msg.source == source:
+                return msg
+        return None
 
     async def _emit(self, event_type: str, detail: str = "", **extra: Any) -> None:
         if self._on_event is None:
@@ -256,9 +310,25 @@ class ClaudeCodeAgent(BaseChatAgent):
         await self._emit("turn_started")
 
         self._cwd.mkdir(parents=True, exist_ok=True)
+        system_prompt = self._system_prompt
+        if self._allowed_tools:
+            # Tool-less reasoning roles always finish in one turn regardless
+            # of max_turns (it's just a runaway guard for them — see
+            # pipeline.py), so telling them a turn count would be noise, not
+            # information. For tool-using roles, always state the actual
+            # current budget — whether it's the static default or a
+            # dynamic estimate set via set_max_turns() — so the agent can
+            # pace itself instead of discovering the ceiling by hitting it.
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                f"TURN BUDGET: you have approximately {self._max_turns} tool-call turns "
+                f"to complete this task. Prioritize the MUST-have functionality first; "
+                f"if you're running low, finish the most critical pieces completely "
+                f"rather than leaving many things partially done."
+            )
         options = ClaudeAgentOptions(
             cwd=str(self._cwd),
-            system_prompt=self._system_prompt,
+            system_prompt=system_prompt,
             # `tools` is what actually restricts which tools exist for this
             # session (verified live: `allowed_tools` alone does NOT — it
             # only skips the permission prompt for tools already available,
@@ -278,28 +348,89 @@ class ClaudeCodeAgent(BaseChatAgent):
         result_text = ""
         cost_usd: float | None = None
         duration_ms: int | None = None
-        async for msg in query(prompt=prompt, options=options):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        transcript.append(block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        await self._emit(
-                            "tool_call",
-                            _summarize_tool_call(block.name, block.input),
-                            tool_name=block.name,
+        hit_max_turns = False
+        try:
+            async for msg in query(prompt=prompt, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            transcript.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            await self._emit(
+                                "tool_call",
+                                _summarize_tool_call(block.name, block.input),
+                                tool_name=block.name,
+                            )
+                elif isinstance(msg, ResultMessage):
+                    if msg.is_error and msg.subtype != "error_max_turns":
+                        # A genuine crash (auth/billing/session-limit/etc.) —
+                        # no usable output exists, so there's nothing to hand
+                        # QA; fail the whole run so --resume can retry this
+                        # turn.
+                        await self._emit("error", msg.result or str(msg.errors))
+                        raise RuntimeError(
+                            f"{self.name}: Claude Code session failed "
+                            f"({msg.subtype}): {msg.result or msg.errors}"
                         )
-            elif isinstance(msg, ResultMessage):
-                if msg.is_error:
-                    await self._emit("error", msg.result or str(msg.errors))
-                    raise RuntimeError(
-                        f"{self.name}: Claude Code session failed "
-                        f"({msg.subtype}): {msg.result or msg.errors}"
-                    )
-                result_text = msg.result or ""
-                cost_usd = msg.total_cost_usd
-                duration_ms = msg.duration_ms
+                    if msg.is_error:
+                        # error_max_turns: the role ran out of its turn
+                        # budget before finishing, not a crash. Real
+                        # production case — a moderately complex full-stack
+                        # goal ran FE/BE/OPS out of a 20-turn budget and took
+                        # the whole pipeline down with it, even though most
+                        # of the work was already on disk. Treat this as
+                        # best-effort partial output instead: `transcript`
+                        # (below) becomes final_text, the run continues to
+                        # QA, and QA — reading the real, genuinely incomplete
+                        # files — can fail it with a concrete defect instead
+                        # of the pipeline dying with nothing to resume into
+                        # but the exact same turn budget.
+                        hit_max_turns = True
+                        await self._emit(
+                            "warning", f"{self.name} hit max_turns ({self._max_turns}) before finishing"
+                        )
+                    else:
+                        result_text = msg.result or ""
+                    cost_usd = msg.total_cost_usd
+                    duration_ms = msg.duration_ms
+        except RuntimeError:
+            raise  # our own deliberate raise above for a genuine crash — propagate as-is
+        except Exception as exc:
+            # The CLI subprocess exits non-zero right after emitting an
+            # error_max_turns ResultMessage ("for shell-script consumers",
+            # per the SDK's own internal comment) — confirmed live: the loop
+            # above already received and handled that ResultMessage on a
+            # prior iteration, then this exception fires on the *next*
+            # iteration of the SAME async-for, from the generator's own
+            # protocol, bypassing the `elif` branches entirely. If we already
+            # saw error_max_turns, this second exception carries no new
+            # information (same "reached maximum number of turns" text) —
+            # swallow it and fall through to the partial-output path below.
+            # Anything else really is an unhandled crash.
+            if not hit_max_turns:
+                await self._emit("error", str(exc))
+                raise RuntimeError(f"{self.name}: Claude Code session failed: {exc}") from exc
 
         final_text = result_text or "\n".join(transcript) or "(no output produced)"
+        final_text = self._apply_verdict_safety_net(final_text)
+
         await self._emit("turn_completed", final_text, cost_usd=cost_usd, duration_ms=duration_ms)
         return Response(chat_message=TextMessage(content=final_text, source=self.name))
+
+    def _apply_verdict_safety_net(self, final_text: str) -> str:
+        """QA/UAT specifically must end in a verdict token — see the
+        module-level comment on `_VALID_VERDICTS`. Pulled out as its own
+        method (pure text logic, no SDK dependency) so it's directly unit
+        -testable; covers max_turns truncation and, as a general safety
+        net, any other case where the model didn't land on a clean final
+        line. No-op for every other role.
+        """
+        fallback_verdict = _FALLBACK_VERDICT.get(self.name)
+        if fallback_verdict is not None and last_line(final_text) not in _VALID_VERDICTS[self.name]:
+            return (
+                f"{final_text}\n\n"
+                f"[INCOMPLETE: this turn ended without reaching a verdict — "
+                f"forcing the conservative default rather than leaving the "
+                f"pipeline with no route to follow.]\n{fallback_verdict}"
+            )
+        return final_text

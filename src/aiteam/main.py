@@ -15,7 +15,7 @@ from pathlib import Path
 from autogen_agentchat.messages import BaseChatMessage
 from autogen_agentchat.teams import GraphFlow
 
-from .pipeline import ARTIFACT_DIR_NAME, build_team
+from .pipeline import ARTIFACT_DIR_NAME, apply_turn_budget_from_architect, build_team
 from .runner import FailFastMonitor, run_team
 
 
@@ -39,8 +39,16 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
         stamp = checkpoint_data["stamp"]
         goal = checkpoint_data["goal"]
         workspace = Path(checkpoint_data["workspace"])
-        team = build_team(workspace, on_event=monitor.on_event)
+        team, agents = build_team(workspace, on_event=monitor.on_event)
         await team.load_state(checkpoint_data["team_state"])
+        # set_max_turns() overrides aren't part of the checkpoint (only
+        # _history is) — if the architect's turn already completed before
+        # the crash, its TECH DESIGN is still in every engineer's replayed
+        # history; re-derive the same dynamic budget from it rather than
+        # silently falling back to the static default on the retry.
+        architect_message = agents["frontend_engineer"].find_message_from("solution_architect")
+        if architect_message is not None:
+            apply_turn_budget_from_architect(architect_message, agents)
         task = None  # continue the previous task rather than starting a new one
         print(f"Resuming run {stamp} from {resume}\nWorkspace: {workspace}\n")
     else:
@@ -48,7 +56,7 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         workspace = output_dir / "workspace" / stamp
         workspace.mkdir(parents=True, exist_ok=True)
-        team = build_team(workspace, on_event=monitor.on_event)
+        team, agents = build_team(workspace, on_event=monitor.on_event)
         task = goal
 
     checkpoint_path = output_dir / "checkpoints" / f"{stamp}.json"
@@ -69,6 +77,13 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
         artifact_dir = workspace / ARTIFACT_DIR_NAME
         artifact_dir.mkdir(parents=True, exist_ok=True)
         (artifact_dir / f"{message.source}.md").write_text(message.to_text())
+        # Once the architect's TECH DESIGN lands, size each engineer's turn
+        # budget to the task instead of leaving them all on the static
+        # default — see pipeline.py's ARCHITECT_PROMPT "Turn Budget
+        # Estimate" section and apply_turn_budget_from_architect().
+        applied_budget = apply_turn_budget_from_architect(message, agents)
+        if applied_budget:
+            print(f"Turn budget applied from architect: {applied_budget}")
         # Checkpoint after every completed agent turn, so a failure
         # (crash, hitting the Claude Code session limit, etc.) only
         # loses the turn in flight — not the whole run.

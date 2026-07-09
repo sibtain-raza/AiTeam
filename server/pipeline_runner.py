@@ -15,7 +15,7 @@ from pathlib import Path
 from autogen_agentchat.messages import BaseChatMessage
 
 from aiteam.claude_code_agent import ClaudeCodeAgent
-from aiteam.pipeline import ARTIFACT_DIR_NAME, build_team
+from aiteam.pipeline import ARTIFACT_DIR_NAME, apply_turn_budget_from_architect, build_team
 from aiteam.runner import FailFastMonitor, run_team
 
 from .db import SessionLocal
@@ -98,7 +98,7 @@ async def run_pipeline(run_id: str, goal: str, agent_cls: type[ClaudeCodeAgent] 
 
     workspace.mkdir(parents=True, exist_ok=True)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    team = build_team(workspace, agent_cls=agent_cls, on_event=monitor.on_event)
+    team, agents = build_team(workspace, agent_cls=agent_cls, on_event=monitor.on_event)
 
     await _record_event(run_id, seq_counter, "system", "run_started", goal, {})
 
@@ -106,6 +106,16 @@ async def run_pipeline(run_id: str, goal: str, agent_cls: type[ClaudeCodeAgent] 
         artifact_dir = workspace / ARTIFACT_DIR_NAME
         artifact_dir.mkdir(parents=True, exist_ok=True)
         (artifact_dir / f"{message.source}.md").write_text(message.to_text())
+
+        # Once the architect's TECH DESIGN lands, size each engineer's turn
+        # budget to the task instead of leaving them all on the static
+        # default — see pipeline.py's ARCHITECT_PROMPT "Turn Budget
+        # Estimate" section and apply_turn_budget_from_architect().
+        applied_budget = apply_turn_budget_from_architect(message, agents)
+        if applied_budget:
+            await _record_event(
+                run_id, seq_counter, "system", "turn_budget_applied", str(applied_budget), {}
+            )
 
         state = await team.save_state()
         checkpoint_path.write_text(

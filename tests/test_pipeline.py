@@ -18,7 +18,7 @@ from pathlib import Path
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import BaseChatMessage
 
-from aiteam.pipeline import build_team
+from aiteam.pipeline import apply_turn_budget_from_architect, build_team, parse_turn_budget
 from aiteam.runner import AgentFailure, FailFastMonitor, run_team
 
 from .mock_agent import CRASH, ScriptedClaudeCodeAgent, set_script
@@ -57,7 +57,7 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def _run(self, script: dict[str, list[str]]) -> TaskResult:
         set_script(script)
-        team = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        team, _agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
         result = None
         async for message in team.run_stream(task="Build a thing."):
             if isinstance(message, TaskResult):
@@ -149,7 +149,7 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        team1 = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        team1, _agents1 = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
         seen: list[str] = []
         checkpoint_state = None
         with self.assertRaises(Exception):
@@ -166,7 +166,7 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         set_script(
             {**BASE_SCRIPT, "qa_engineer": [QA_PASS_TEXT], "uat_reviewer": [UAT_APPROVED_TEXT]}
         )
-        team2 = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        team2, _agents2 = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
         await team2.load_state(checkpoint_state)
 
         resumed: list[str] = []
@@ -204,7 +204,9 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         monitor = FailFastMonitor()
-        team = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent, on_event=monitor.on_event)
+        team, _agents = build_team(
+            self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent, on_event=monitor.on_event
+        )
 
         async def on_message(_message: BaseChatMessage) -> None:
             pass

@@ -100,6 +100,7 @@ PROCESS:
    - Observability: structured logging with request correlation, health and readiness endpoints, and which NFR-n each mechanism verifies
 5. Break work into tasks. Tag every task [FE], [BE], or [OPS]. Each task lists: id, description, contract(s) it implements, and which acceptance criteria (AC-n) and NFRs (NFR-n) it satisfies. Every AC-n AND NFR-n from the PRD MUST map to at least one task — if an NFR maps to no task, redesign until it does.
 6. Call out risks (top 3–5) and the mitigation baked into the design for each.
+7. Estimate a turn budget for each of FE/BE/OPS: how many tool-call turns (each Read/Write/Edit/Bash invocation is one turn) that engineer will realistically need to complete their tagged tasks end to end, including writing tests and self-verifying. Budget generously enough to actually finish — an engineer that runs out of turns mid-task produces incomplete, unverified work, which costs far more (a QA_FAIL rework loop) than a few extra turns would have. Rough guide: a handful of files with little real logic ≈ 10-15 turns; multiple files with moderate logic (auth, several endpoints, a non-trivial UI, DB migrations) ≈ 20-35; many files or unusually complex logic ≈ 35-50. A role with no tagged tasks still gets a small placeholder budget (e.g. 5) rather than 0.
 
 OUTPUT ARTIFACT:
 # TECH DESIGN
@@ -108,6 +109,7 @@ OUTPUT ARTIFACT:
 ## Interface Contracts
 ## Cross-Cutting Design    (security, reliability, observability — mapped to NFR-n)
 ## Task Breakdown          (T-1 [BE] ..., T-2 [FE] ..., each with "Satisfies: AC-n, NFR-n")
+## Turn Budget Estimate    (exactly one line per role, format "FE: <N> — <one-line reason>", same for BE and OPS)
 ## Risks
 ## Assumptions
 ```
