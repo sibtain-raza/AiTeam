@@ -54,9 +54,19 @@ class ParseTurnBudgetTests(unittest.TestCase):
         self.assertEqual(parse_turn_budget(text), {"FE": 20})
 
     def test_clamps_below_minimum(self) -> None:
-        text = "## Turn Budget Estimate\nFE: 1 — trivial\nBE: 2 — trivial\nOPS: 0 — trivial\n"
+        text = "## Turn Budget Estimate\nFE: 1 — trivial\nBE: 2 — trivial\nOPS: 3 — trivial\n"
         result = parse_turn_budget(text)
         self.assertEqual(result, {"FE": MIN_ENGINEER_TURNS, "BE": MIN_ENGINEER_TURNS, "OPS": MIN_ENGINEER_TURNS})
+
+    def test_zero_is_not_clamped_up_it_signals_skip(self) -> None:
+        """A budget of exactly 0 means "no tasks assigned to this role" (see
+        ARCHITECT_PROMPT) and must survive parsing as 0 — ClaudeCodeAgent
+        .on_messages() reads `_max_turns == 0` as "skip this engineer's
+        session entirely". Clamping it up to MIN_ENGINEER_TURNS like any
+        other low estimate would silently turn every "nothing to do" signal
+        back into a real, wasted session."""
+        text = "## Turn Budget Estimate\nFE: 15 — normal\nBE: 0 — no server-side logic needed\nOPS: 0 — nothing to deploy\n"
+        self.assertEqual(parse_turn_budget(text), {"FE": 15, "BE": 0, "OPS": 0})
 
     def test_clamps_above_maximum(self) -> None:
         text = "## Turn Budget Estimate\nFE: 500 — way overestimated\nBE: 9999 — way overestimated\nOPS: 60 — way overestimated\n"
@@ -105,6 +115,20 @@ class ApplyTurnBudgetTests(unittest.TestCase):
         )
         self.assertEqual(agents["qa_engineer"]._max_turns, qa_before)
         self.assertEqual(agents["product_manager"]._max_turns, pm_before)
+
+    def test_applies_a_zero_budget_meaning_skip_this_engineer(self) -> None:
+        agents = self._agents()
+        text = (
+            "# TECH DESIGN\n## Task Breakdown\nT-1 [FE] one page\n"
+            "## Turn Budget Estimate\nFE: 12 — one page\nBE: 0 — no server-side logic\nOPS: 0 — nothing to deploy\n"
+        )
+        applied = apply_turn_budget_from_architect(
+            TextMessage(content=text, source="solution_architect"), agents
+        )
+        self.assertEqual(applied, {"FE": 12, "BE": 0, "OPS": 0})
+        self.assertEqual(agents["frontend_engineer"]._max_turns, 12)
+        self.assertEqual(agents["backend_engineer"]._max_turns, 0)
+        self.assertEqual(agents["devops_engineer"]._max_turns, 0)
 
     def test_no_budget_section_leaves_defaults_unchanged(self) -> None:
         agents = self._agents()

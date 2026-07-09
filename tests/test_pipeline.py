@@ -10,6 +10,7 @@ Run with:  PYTHONPATH=src:. .venv/bin/python -m unittest discover -s tests -v
 """
 
 import asyncio
+import copy
 import shutil
 import tempfile
 import unittest
@@ -18,7 +19,12 @@ from pathlib import Path
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import BaseChatMessage
 
-from aiteam.pipeline import apply_turn_budget_from_architect, build_team, parse_turn_budget
+from aiteam.pipeline import (
+    apply_turn_budget_from_architect,
+    build_team,
+    parse_turn_budget,
+    recover_stuck_agents,
+)
 from aiteam.runner import AgentFailure, FailFastMonitor, run_team
 
 from .mock_agent import CRASH, ScriptedClaudeCodeAgent, set_script
@@ -214,6 +220,128 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AgentFailure) as ctx:
             await asyncio.wait_for(run_team(team, "Build a thing.", on_message, monitor), timeout=10)
         self.assertEqual(ctx.exception.source, "frontend_engineer")
+
+
+    async def test_checkpoint_resume_recovers_from_a_crash_mid_fan_out(self) -> None:
+        """Regression test for a real, reproduced bug: when one of several
+        PARALLEL engineers (devops_engineer here) crashes while its siblings
+        (frontend_engineer/backend_engineer) complete successfully,
+        GraphFlow's OWN checkpoint has no record that devops_engineer was
+        dispatched but never finished — `GraphFlowManagerState
+        .select_speaker()` clears that node's "needs to run" bookkeeping the
+        instant it's selected, before it actually executes. Confirmed live:
+        resuming such a checkpoint unmodified produces a run that reports
+        "group chat is stopped" with zero new turns, even though
+        devops_engineer clearly still has pending work.
+
+        `recover_stuck_agents()` is the fix: it patches the raw checkpoint
+        dict (using `ClaudeCodeAgent._turn_in_progress`, which DOES survive
+        the crash) so devops_engineer is re-enqueued before `load_state()`.
+        This test resumes WITHOUT calling it first to prove the bug is real,
+        then resumes again WITH it to prove the fix works end-to-end.
+        """
+        set_script(
+            {
+                **BASE_SCRIPT,
+                "devops_engineer": [CRASH],
+                "qa_engineer": [QA_PASS_TEXT],
+                "uat_reviewer": [UAT_APPROVED_TEXT],
+            }
+        )
+        team1, _agents1 = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        seen: list[str] = []
+        checkpoint_state = None
+        with self.assertRaises(Exception):
+            async for message in team1.run_stream(task="Build a thing."):
+                if isinstance(message, BaseChatMessage):
+                    seen.append(message.source)
+                    checkpoint_state = await team1.save_state()
+        assert checkpoint_state is not None
+        # frontend_engineer/backend_engineer completed; devops_engineer crashed mid-turn.
+        self.assertIn("frontend_engineer", seen)
+        self.assertIn("backend_engineer", seen)
+        self.assertNotIn("devops_engineer", seen)
+
+        # "Fix" the crash for the retry, as a human would.
+        fixed_script = {
+            **BASE_SCRIPT,
+            "devops_engineer": [OPS_TEXT],
+            "qa_engineer": [QA_PASS_TEXT],
+            "uat_reviewer": [UAT_APPROVED_TEXT],
+        }
+
+        # Prove the bug: resuming unmodified makes zero progress.
+        unpatched_state = copy.deepcopy(checkpoint_state)
+        set_script(fixed_script)
+        team_unpatched, _agents_unpatched = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        await team_unpatched.load_state(unpatched_state)
+        stalled: list[str] = []
+        async for message in team_unpatched.run_stream(task=None):
+            if isinstance(message, BaseChatMessage):
+                stalled.append(message.source)
+        self.assertEqual(stalled, [], "unpatched resume should make no progress (this is the bug)")
+
+        # Now prove the fix: recover_stuck_agents() + resume completes the run.
+        patched_state = copy.deepcopy(checkpoint_state)
+        recovered = recover_stuck_agents(patched_state)
+        self.assertEqual(recovered, ["devops_engineer"])
+        set_script(fixed_script)
+        team2, _agents2 = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        await team2.load_state(patched_state)
+
+        resumed: list[str] = []
+        async for message in team2.run_stream(task=None):
+            if isinstance(message, BaseChatMessage):
+                resumed.append(message.source)
+
+        self.assertNotIn("frontend_engineer", resumed, "FE already completed — must not rerun")
+        self.assertNotIn("backend_engineer", resumed, "BE already completed — must not rerun")
+        self.assertIn("devops_engineer", resumed, "the crashed OPS turn must retry")
+        self.assertIn("qa_engineer", resumed)
+        self.assertIn("release_reporter", resumed)
+
+
+class RecoverStuckAgentsTests(unittest.TestCase):
+    """Pure dict-manipulation unit tests for recover_stuck_agents(), no
+    GraphFlow/asyncio involved — see the docstring on the function itself
+    and PipelineOrchestrationTests.test_checkpoint_resume_recovers_from_a_
+    crash_mid_fan_out for the full end-to-end regression coverage."""
+
+    def test_recovers_agent_with_turn_in_progress(self) -> None:
+        state = {
+            "agent_states": {
+                "GraphManager": {"ready": []},
+                "frontend_engineer": {"agent_state": {"turn_in_progress": False}},
+                "devops_engineer": {"agent_state": {"turn_in_progress": True}},
+            }
+        }
+        recovered = recover_stuck_agents(state)
+        self.assertEqual(recovered, ["devops_engineer"])
+        self.assertEqual(state["agent_states"]["GraphManager"]["ready"], ["devops_engineer"])
+
+    def test_no_op_when_nothing_stuck(self) -> None:
+        state = {
+            "agent_states": {
+                "GraphManager": {"ready": []},
+                "frontend_engineer": {"agent_state": {"turn_in_progress": False}},
+            }
+        }
+        self.assertEqual(recover_stuck_agents(state), [])
+        self.assertEqual(state["agent_states"]["GraphManager"]["ready"], [])
+
+    def test_does_not_duplicate_an_already_ready_agent(self) -> None:
+        state = {
+            "agent_states": {
+                "GraphManager": {"ready": ["devops_engineer"]},
+                "devops_engineer": {"agent_state": {"turn_in_progress": True}},
+            }
+        }
+        self.assertEqual(recover_stuck_agents(state), [])
+        self.assertEqual(state["agent_states"]["GraphManager"]["ready"], ["devops_engineer"])
+
+    def test_missing_graph_manager_is_a_no_op(self) -> None:
+        state = {"agent_states": {"devops_engineer": {"agent_state": {"turn_in_progress": True}}}}
+        self.assertEqual(recover_stuck_agents(state), [])
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from pathlib import Path
 from autogen_agentchat.messages import BaseChatMessage
 from autogen_agentchat.teams import GraphFlow
 
-from .pipeline import ARTIFACT_DIR_NAME, apply_turn_budget_from_architect, build_team
+from .pipeline import ARTIFACT_DIR_NAME, apply_turn_budget_from_architect, build_team, recover_stuck_agents
 from .runner import FailFastMonitor, run_team
 
 
@@ -40,6 +40,15 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
         goal = checkpoint_data["goal"]
         workspace = Path(checkpoint_data["workspace"])
         team, agents = build_team(workspace, on_event=monitor.on_event)
+        # A crash mid-fan-out (e.g. devops_engineer fails while
+        # frontend_engineer/backend_engineer succeed) leaves GraphFlow's own
+        # checkpoint with no record that the crashed node was dispatched but
+        # never finished — see recover_stuck_agents()'s docstring for why.
+        # Patch the raw checkpoint dict before load_state() so that agent
+        # actually retries instead of the resumed run completing zero turns.
+        recovered = recover_stuck_agents(checkpoint_data["team_state"])
+        if recovered:
+            print(f"Recovered stuck agent(s) from crashed turn: {', '.join(recovered)}")
         await team.load_state(checkpoint_data["team_state"])
         # set_max_turns() overrides aren't part of the checkpoint (only
         # _history is) — if the architect's turn already completed before

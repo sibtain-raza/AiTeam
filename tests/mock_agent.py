@@ -15,6 +15,7 @@ repeats — so a role that should behave the same way every turn only needs
 one entry (e.g. `{"qa_engineer": ["...\\nQA_PASS"]}` always passes).
 """
 
+import asyncio
 from collections import defaultdict
 from typing import Sequence
 
@@ -31,6 +32,19 @@ class _Crash:
     consumer simply stopping mid-`async for`, which does not: the runtime
     is a producer/consumer queue, and with near-instant scripted responses
     it races ahead of a paused consumer rather than pausing with it.
+
+    `ScriptedClaudeCodeAgent` awaits a small delay before actually raising
+    (see below) for the same underlying reason: a real crash happens after
+    a genuinely slow claude_agent_sdk session (many seconds at least), by
+    which time the runtime's internal single-threaded queue has always long
+    since finished propagating any sibling's completed response (that
+    in-memory propagation takes microseconds). Without the delay, a
+    same-tick scripted crash can race ahead of a concurrently-completing
+    sibling's own broadcast — confirmed live: GraphManager's own
+    `message_thread`/`remaining` bookkeeping ended up missing a sibling
+    that had, by every other measure, already finished — which is a
+    timing artifact of instant mock responses, not a bug that manifests
+    against real, slow Claude Code sessions.
     """
 
 
@@ -69,13 +83,25 @@ class ScriptedClaudeCodeAgent(ClaudeCodeAgent):
         self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
     ) -> Response:
         self._history.extend(messages)
+        # Mirror the real ClaudeCodeAgent's turn_in_progress bookkeeping (see
+        # claude_code_agent.py) so tests exercising a mid-turn CRASH — e.g.
+        # test_checkpoint_resume_recovers_from_a_crash_mid_fan_out — see the
+        # same "dispatched but never completed" flag a real crash leaves
+        # behind, which is what recover_stuck_agents() (pipeline.py) reads
+        # from the checkpoint.
+        self._turn_in_progress = True
         await self._emit("turn_started")
         responses = _scripts.get(self.name, ["(no script configured for this agent)"])
         idx = min(_call_counts[self.name], len(responses) - 1)
         _call_counts[self.name] += 1
         entry = responses[idx]
         if isinstance(entry, _Crash):
+            # See _Crash's docstring: this delay lets any concurrently
+            # -completing sibling's response finish propagating through
+            # the runtime first, matching realistic timing.
+            await asyncio.sleep(0.05)
             await self._emit("error", "simulated crash (scripted)")
             raise RuntimeError(f"{self.name}: simulated crash (scripted)")
+        self._turn_in_progress = False
         await self._emit("turn_completed", entry, cost_usd=0.0, duration_ms=0)
         return Response(chat_message=TextMessage(content=entry, source=self.name))

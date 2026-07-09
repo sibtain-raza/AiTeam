@@ -52,14 +52,21 @@ def parse_turn_budget(text: str) -> dict[str, int]:
     """Extract the architect's per-role turn estimates from its TECH
     DESIGN's "## Turn Budget Estimate" section (format one line per role:
     "FE: <N> — <reason>"). Each parsed value is clamped into
-    [MIN_ENGINEER_TURNS, MAX_ENGINEER_TURNS]. A role that's missing or
-    didn't parse is simply absent from the result — the caller keeps
+    [MIN_ENGINEER_TURNS, MAX_ENGINEER_TURNS] — EXCEPT 0, which is left
+    untouched: per ARCHITECT_PROMPT, a budget of exactly 0 is the
+    architect's deliberate signal that this role has zero tagged tasks,
+    and `ClaudeCodeAgent.on_messages()` treats `_max_turns == 0` as "skip
+    this engineer's session entirely" (see its docstring). Clamping 0 up
+    to MIN_ENGINEER_TURNS would silently turn every "no work for this
+    role" signal back into a real (wasted) session. A role that's missing
+    or didn't parse is simply absent from the result — the caller keeps
     whatever budget that engineer already has (the static ENGINEER_MAX_TURNS
     default from build_team(), unless a prior turn already set one).
     """
     budget: dict[str, int] = {}
     for role, value in _TURN_BUDGET_LINE.findall(text):
-        budget[role] = max(MIN_ENGINEER_TURNS, min(MAX_ENGINEER_TURNS, int(value)))
+        n = int(value)
+        budget[role] = n if n == 0 else max(MIN_ENGINEER_TURNS, min(MAX_ENGINEER_TURNS, n))
     return budget
 
 
@@ -87,6 +94,61 @@ def apply_turn_budget_from_architect(
         if agent is not None:
             agent.set_max_turns(n)
     return budget
+
+
+def recover_stuck_agents(team_state: dict) -> list[str]:
+    """Patch a raw GraphFlow checkpoint dict so a crashed-mid-fan-out agent
+    actually retries on `--resume`, instead of the run silently completing
+    zero turns.
+
+    The gap this works around lives in AutoGen itself, not in this
+    codebase: `GraphFlowManagerState.select_speaker()` (see
+    `_digraph_group_chat.py`) drains its `_ready` queue and resets a
+    dispatched node's activation bookkeeping the INSTANT it's selected to
+    speak — before that node's agent has actually run, let alone completed.
+    There is no "dispatched but not finished" state in GraphFlow's own
+    checkpoint. So when one of several parallel siblings (e.g. `devops
+    _engineer` alongside `frontend_engineer`/`backend_engineer`) crashes
+    mid-turn, the checkpoint saved right after captures `_ready` already
+    empty and the crashed node's own activation counters already reset to
+    their pre-triggered state — nothing will ever re-enqueue it, because
+    the parent (`solution_architect`) already sent its one and only
+    message and isn't going to run again. Confirmed live: resuming such a
+    checkpoint via `team.load_state()` unmodified produces a run that
+    matches every termination check on its very first step and reports
+    "group chat is stopped" with zero new turns.
+
+    The fix is possible because `ClaudeCodeAgent` tracks its own
+    `_turn_in_progress` flag (set True when `on_messages()` accepts a turn,
+    False only once it returns successfully — see claude_code_agent.py),
+    which DOES survive the crash in the checkpoint, since it's part of
+    that agent's own `save_state()`. Any agent whose saved state still has
+    `turn_in_progress: True` was dispatched but never finished — this
+    function appends each such name back onto `GraphManager`'s saved
+    `ready` list (a plain list of node names; `select_speaker()` just pops
+    from it) so the very next `select_speaker()` call after resume
+    re-dispatches it. The crashed agent's own `message_buffer` (a
+    separate, container-level list — untouched by any of this) still
+    holds the exact messages it needs, because `ChatAgentContainer` only
+    clears that buffer on a *successful* completion, never on a crash.
+
+    Mutates `team_state` in place (call before `team.load_state(
+    team_state)`) and returns the list of agent names it recovered, purely
+    so a caller can log what happened.
+    """
+    agent_states = team_state.get("agent_states", {})
+    graph_manager = agent_states.get("GraphManager")
+    if graph_manager is None:
+        return []
+    ready = graph_manager.setdefault("ready", [])
+    recovered = []
+    for name, state in agent_states.items():
+        if name == "GraphManager":
+            continue
+        if state.get("agent_state", {}).get("turn_in_progress") and name not in ready:
+            ready.append(name)
+            recovered.append(name)
+    return recovered
 
 
 def verdict_is(token: str):

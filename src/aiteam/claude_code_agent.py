@@ -204,6 +204,14 @@ class ClaudeCodeAgent(BaseChatAgent):
         self._max_turns = max_turns
         self._allowed_tools = list(allowed_tools)
         self._history: list[BaseChatMessage] = []
+        # True from the moment on_messages() accepts a turn until it returns
+        # successfully. GraphFlow's own checkpoint has no concept of
+        # "dispatched but not completed" — select_speaker() clears a node's
+        # "needs to run" bookkeeping the instant it's picked, before the
+        # agent actually executes (see pipeline.py's recover_stuck_agents()
+        # docstring for the full story). This flag is how a resume detects
+        # that gap and repairs it.
+        self._turn_in_progress = False
         self._model = os.environ.get("AITEAM_CODE_MODEL", DEFAULT_MODEL)
         self._hooks = _make_hooks(cwd)
         self._context_sources = dict(context_sources) if context_sources is not None else None
@@ -297,17 +305,51 @@ class ClaudeCodeAgent(BaseChatAgent):
         # agent") — override it so `self._history` (the accumulated
         # upstream context this agent replays into every fresh query()
         # call) survives a GraphFlow checkpoint/resume round-trip.
-        return {"history": [msg.dump() for msg in self._history]}
+        return {
+            "history": [msg.dump() for msg in self._history],
+            "turn_in_progress": self._turn_in_progress,
+        }
 
     async def load_state(self, state: Mapping[str, Any]) -> None:
         self._history = [TextMessage.load(data) for data in state.get("history", [])]
+        self._turn_in_progress = state.get("turn_in_progress", False)
 
     async def on_messages(
         self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
     ) -> Response:
         self._history.extend(messages)
-        prompt = self._build_prompt(new_sources={msg.source for msg in messages})
+        self._turn_in_progress = True
         await self._emit("turn_started")
+
+        if self._allowed_tools and self._max_turns == 0:
+            # ARCHITECT_PROMPT instructs the architect to set a role's turn
+            # budget to exactly 0 when its own Task Breakdown assigns it
+            # zero tasks (see set_max_turns()/pipeline.py's
+            # apply_turn_budget_from_architect() and parse_turn_budget()'s
+            # 0-is-not-clamped exemption). Treat that as "nothing to do"
+            # and skip the real Claude Code session entirely instead of
+            # spending a full paid agentic turn just to confirm there's no
+            # work — the fix for a real, observed failure mode where the
+            # architect always invented busywork (backend validation
+            # services, Terraform/CI) for every engineer on every goal,
+            # even a single static page, because nothing let it leave a
+            # role genuinely idle.
+            final_text = (
+                f"# {self.name.upper()} IMPLEMENTATION\n\n"
+                "No tasks were assigned to this role in the TECH DESIGN "
+                "(turn budget: 0) — skipped without starting a Claude Code "
+                "session.\n\n"
+                "## Files Written\n(none)\n\n"
+                "## Tasks Completed\n(none)\n\n"
+                "## Assumptions\n"
+                "The architect's Task Breakdown assigned zero tasks to this "
+                "role for this goal.\n"
+            )
+            self._turn_in_progress = False
+            await self._emit("turn_completed", final_text, cost_usd=0.0, duration_ms=0)
+            return Response(chat_message=TextMessage(content=final_text, source=self.name))
+
+        prompt = self._build_prompt(new_sources={msg.source for msg in messages})
 
         self._cwd.mkdir(parents=True, exist_ok=True)
         system_prompt = self._system_prompt
@@ -414,6 +456,7 @@ class ClaudeCodeAgent(BaseChatAgent):
         final_text = result_text or "\n".join(transcript) or "(no output produced)"
         final_text = self._apply_verdict_safety_net(final_text)
 
+        self._turn_in_progress = False
         await self._emit("turn_completed", final_text, cost_usd=cost_usd, duration_ms=duration_ms)
         return Response(chat_message=TextMessage(content=final_text, source=self.name))
 
