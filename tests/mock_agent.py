@@ -23,7 +23,7 @@ from autogen_agentchat.base import Response
 from autogen_agentchat.messages import BaseChatMessage, TextMessage
 from autogen_core import CancellationToken
 
-from aiteam.claude_code_agent import ClaudeCodeAgent
+from looper.claude_code_agent import ClaudeCodeAgent
 
 class _Crash:
     """Script sentinel: raise instead of responding, simulating a real

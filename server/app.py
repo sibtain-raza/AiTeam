@@ -1,4 +1,4 @@
-"""FastAPI app: control-plane API for the AiTeam web UI.
+"""FastAPI app: control-plane API for the Looper web UI.
 
 Run with (from repo root):
     PYTHONPATH=src .venv/bin/uvicorn server.app:app --reload --port 8000
@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="AiTeam API", lifespan=lifespan)
+app = FastAPI(title="Looper API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

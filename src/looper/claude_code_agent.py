@@ -44,7 +44,7 @@ _VALID_VERDICTS = {
 _FALLBACK_VERDICT = {"qa_engineer": "QA_FAIL", "uat_reviewer": "UAT_REJECTED"}
 
 # Sonnet, not Claude Code's own default (typically Opus-tier), for every
-# agent unless AITEAM_CODE_MODEL overrides it. This pipeline runs many real
+# agent unless LOOPER_CODE_MODEL overrides it. This pipeline runs many real
 # agentic sessions per goal (8 base turns, more with QA rework loops), all
 # drawing the same Claude Code session/usage quota as interactive use —
 # Sonnet is materially cheaper/faster per session with no code change
@@ -212,7 +212,7 @@ class ClaudeCodeAgent(BaseChatAgent):
         # docstring for the full story). This flag is how a resume detects
         # that gap and repairs it.
         self._turn_in_progress = False
-        self._model = os.environ.get("AITEAM_CODE_MODEL", DEFAULT_MODEL)
+        self._model = os.environ.get("LOOPER_CODE_MODEL", DEFAULT_MODEL)
         self._hooks = _make_hooks(cwd)
         self._context_sources = dict(context_sources) if context_sources is not None else None
         self._pointer_files = dict(pointer_files) if pointer_files is not None else None

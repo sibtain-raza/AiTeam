@@ -13,7 +13,7 @@ from pathlib import Path
 
 from autogen_agentchat.messages import TextMessage
 
-from aiteam.claude_code_agent import ClaudeCodeAgent
+from looper.claude_code_agent import ClaudeCodeAgent
 
 
 def make_agent(
@@ -24,7 +24,7 @@ def make_agent(
         name="test_agent",
         description="test",
         system_prompt="test",
-        cwd=Path(tempfile.gettempdir()) / "aiteam_ctx_filter_test",
+        cwd=Path(tempfile.gettempdir()) / "looper_ctx_filter_test",
         context_sources=context_sources,
         pointer_files=pointer_files,
     )
@@ -100,7 +100,7 @@ class PointerFileTests(unittest.TestCase):
     actually exists (missing file falls back to inline)."""
 
     def setUp(self) -> None:
-        self.docs = Path(tempfile.mkdtemp(prefix="aiteam_ptr_test_"))
+        self.docs = Path(tempfile.mkdtemp(prefix="looper_ptr_test_"))
         self.design_file = self.docs / "solution_architect.md"
         self.context = {"user": "all", "solution_architect": "latest", "qa_engineer": "latest"}
         self.pointers = {"solution_architect": self.design_file}

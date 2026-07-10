@@ -1,6 +1,6 @@
 export const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
-const TOKEN_KEY = "aiteam_token";
+const TOKEN_KEY = "looper_token";
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);

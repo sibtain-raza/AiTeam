@@ -17,7 +17,7 @@ from pathlib import Path
 
 from autogen_agentchat.messages import TextMessage
 
-from aiteam.pipeline import (
+from looper.pipeline import (
     MAX_ENGINEER_TURNS,
     MIN_ENGINEER_TURNS,
     apply_turn_budget_from_architect,
@@ -80,7 +80,7 @@ class ParseTurnBudgetTests(unittest.TestCase):
 
 class ApplyTurnBudgetTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.workspace_dir = Path(tempfile.mkdtemp(prefix="aiteam_budget_test_"))
+        self.workspace_dir = Path(tempfile.mkdtemp(prefix="looper_budget_test_"))
 
     def tearDown(self) -> None:
         shutil.rmtree(self.workspace_dir, ignore_errors=True)
@@ -147,7 +147,7 @@ class FindMessageFromTests(unittest.TestCase):
     (present there because context_sources includes solution_architect)."""
 
     def setUp(self) -> None:
-        self.workspace_dir = Path(tempfile.mkdtemp(prefix="aiteam_budget_resume_test_"))
+        self.workspace_dir = Path(tempfile.mkdtemp(prefix="looper_budget_resume_test_"))
 
     def tearDown(self) -> None:
         shutil.rmtree(self.workspace_dir, ignore_errors=True)

@@ -238,7 +238,7 @@ def build_team(
     # working budget. Engineer/QA budgets are a real cost lever: each is a
     # full agentic session (writing files, running builds/tests), and QA
     # rework loops repeat FE/BE/OPS, so these numbers multiply fast across a
-    # run. Lower them further (or set AITEAM_CODE_MODEL to a cheaper model)
+    # run. Lower them further (or set LOOPER_CODE_MODEL to a cheaper model)
     # if you're hitting the Claude Code session/usage limit.
     REASONING_MAX_TURNS = 3
     ENGINEER_MAX_TURNS = 20

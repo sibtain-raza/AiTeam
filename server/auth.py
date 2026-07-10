@@ -12,13 +12,13 @@ import bcrypt
 from jose import JWTError, jwt
 
 _DEFAULT_SECRET = "dev-secret-change-me"
-SECRET_KEY = os.environ.get("AITEAM_JWT_SECRET", _DEFAULT_SECRET)
+SECRET_KEY = os.environ.get("LOOPER_JWT_SECRET", _DEFAULT_SECRET)
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
 
 if SECRET_KEY == _DEFAULT_SECRET:
     print(
-        "WARNING: AITEAM_JWT_SECRET is not set — using an insecure default. "
+        "WARNING: LOOPER_JWT_SECRET is not set — using an insecure default. "
         "Set a real secret before deploying this anywhere but localhost."
     )
 

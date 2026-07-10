@@ -24,7 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from aiteam.claude_code_agent import ClaudeCodeAgent
+from looper.claude_code_agent import ClaudeCodeAgent
 
 
 def make_agent(name: str) -> ClaudeCodeAgent:
@@ -32,7 +32,7 @@ def make_agent(name: str) -> ClaudeCodeAgent:
         name=name,
         description="test",
         system_prompt="test",
-        cwd=Path(tempfile.gettempdir()) / "aiteam_verdict_safety_test",
+        cwd=Path(tempfile.gettempdir()) / "looper_verdict_safety_test",
     )
 
 

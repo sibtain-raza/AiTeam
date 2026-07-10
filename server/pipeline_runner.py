@@ -14,9 +14,9 @@ from pathlib import Path
 
 from autogen_agentchat.messages import BaseChatMessage
 
-from aiteam.claude_code_agent import ClaudeCodeAgent
-from aiteam.pipeline import ARTIFACT_DIR_NAME, apply_turn_budget_from_architect, build_team
-from aiteam.runner import FailFastMonitor, run_team
+from looper.claude_code_agent import ClaudeCodeAgent
+from looper.pipeline import ARTIFACT_DIR_NAME, apply_turn_budget_from_architect, build_team
+from looper.runner import FailFastMonitor, run_team
 
 from .db import SessionLocal
 from .events import broker
@@ -92,7 +92,7 @@ async def run_pipeline(run_id: str, goal: str, agent_cls: type[ClaudeCodeAgent] 
     # (e.g. hitting the turn cap) stops the whole run immediately instead
     # of leaving the other engineers to keep working — and spending real
     # Claude Code quota — against a pipeline that's already doomed. See
-    # aiteam/runner.py for why this doesn't rely on GraphFlow's own error
+    # looper/runner.py for why this doesn't rely on GraphFlow's own error
     # propagation (confirmed live: it doesn't work reliably).
     monitor = FailFastMonitor(on_event)
 

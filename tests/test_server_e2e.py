@@ -22,7 +22,7 @@ import unittest
 # by one connection are invisible to the next — use a throwaway file
 # instead, matching how a real run's DB is a single shared file.
 _TMP_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-os.environ.setdefault("AITEAM_DB_URL", f"sqlite:///{_TMP_DB.name}")
+os.environ.setdefault("LOOPER_DB_URL", f"sqlite:///{_TMP_DB.name}")
 
 import httpx
 

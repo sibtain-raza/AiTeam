@@ -1,8 +1,8 @@
 """CLI entry point.
 
 Usage:
-    python -m aiteam.main "Build a URL shortener with custom aliases and click analytics."
-    python -m aiteam.main --resume output/checkpoints/20260707-223327.json
+    python -m looper.main "Build a URL shortener with custom aliases and click analytics."
+    python -m looper.main --resume output/checkpoints/20260707-223327.json
 """
 
 import argparse
@@ -72,7 +72,7 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     transcript = output_dir / f"run-{stamp}.md"
     if resume is None:
-        transcript.write_text(f"# AiTeam run — {stamp}\n\nGOAL: {goal}\n\n---\n\n")
+        transcript.write_text(f"# Looper run — {stamp}\n\nGOAL: {goal}\n\n---\n\n")
 
     async def on_message(message: BaseChatMessage) -> None:
         print(f"\n---------- {message.source} ----------\n{message.to_text()}")
@@ -106,7 +106,7 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
     except Exception as exc:
         print(f"\nRun failed: {exc}")
         print(f"Progress checkpointed to {checkpoint_path} — resume with:")
-        print(f'  PYTHONPATH=src python -m aiteam.main --resume "{checkpoint_path}"')
+        print(f'  PYTHONPATH=src python -m looper.main --resume "{checkpoint_path}"')
         raise
 
     print(f"\nStop reason: {stop_reason}")
@@ -115,11 +115,11 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the AiTeam delivery pipeline")
+    parser = argparse.ArgumentParser(description="Run the Looper delivery pipeline")
     parser.add_argument("goal", nargs="?", help="The software goal to build (omit when using --resume)")
     parser.add_argument(
         "--output-dir",
-        default=os.environ.get("AITEAM_OUTPUT_DIR", "output"),
+        default=os.environ.get("LOOPER_OUTPUT_DIR", "output"),
         help="Directory for run transcripts (default: ./output)",
     )
     parser.add_argument(

@@ -8,7 +8,7 @@ which run and the live event feed the UI subscribes to.
 
 Phase 1 (see README "Honest limitations"): SQLite, single file, no
 migrations tooling — deliberately minimal for a not-yet-multi-tenant-hardened
-deployment. Override AITEAM_DB_URL for Postgres etc. when that changes.
+deployment. Override LOOPER_DB_URL for Postgres etc. when that changes.
 """
 
 import os
@@ -16,7 +16,7 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-DB_URL = os.environ.get("AITEAM_DB_URL", "sqlite:///./aiteam_web.db")
+DB_URL = os.environ.get("LOOPER_DB_URL", "sqlite:///./looper_web.db")
 
 _connect_args = {"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
 engine = create_engine(DB_URL, connect_args=_connect_args)

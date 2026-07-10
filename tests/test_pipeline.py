@@ -19,13 +19,13 @@ from pathlib import Path
 from autogen_agentchat.base import TaskResult
 from autogen_agentchat.messages import BaseChatMessage
 
-from aiteam.pipeline import (
+from looper.pipeline import (
     apply_turn_budget_from_architect,
     build_team,
     parse_turn_budget,
     recover_stuck_agents,
 )
-from aiteam.runner import AgentFailure, FailFastMonitor, run_team
+from looper.runner import AgentFailure, FailFastMonitor, run_team
 
 from .mock_agent import CRASH, ScriptedClaudeCodeAgent, set_script
 
@@ -56,7 +56,7 @@ def sources(messages: list) -> list[str]:
 
 class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.workspace_dir = Path(tempfile.mkdtemp(prefix="aiteam_test_"))
+        self.workspace_dir = Path(tempfile.mkdtemp(prefix="looper_test_"))
 
     def tearDown(self) -> None:
         shutil.rmtree(self.workspace_dir, ignore_errors=True)

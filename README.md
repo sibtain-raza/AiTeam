@@ -1,4 +1,4 @@
-# AiTeam
+# Looper
 
 An experimental autonomous software delivery pipeline: eight AI agents take a raw one-line goal and carry it through grooming, design, implementation, QA, and UAT — with the engineering roles actually writing files, running builds, and executing tests in a real workspace on disk, not just describing code in chat.
 
@@ -46,7 +46,7 @@ Most multi-agent "AI software team" demos share a specific weakness: every role,
 - An "OPS deliverable" can claim a Docker setup works without `docker build` ever having been run against it.
 - A defect can be marked "fixed" because the diff looks plausible, not because a previously-failing check now passes.
 
-AiTeam exists to close that gap for the roles where it matters — the engineers and QA — while keeping the roles that are genuinely pure reasoning tasks (grooming, architecture, UAT judgment) as plain text generation, since tool access wouldn't help them there.
+Looper exists to close that gap for the roles where it matters — the engineers and QA — while keeping the roles that are genuinely pure reasoning tasks (grooming, architecture, UAT judgment) as plain text generation, since tool access wouldn't help them there.
 
 ---
 
@@ -58,7 +58,7 @@ Two different techniques, combined in one pipeline:
 
 2. **The Claude Agent SDK drives *execution*** for the engineering roles. Instead of an LLM completion that inlines code as chat text, `frontend_engineer`, `backend_engineer`, `devops_engineer`, and `qa_engineer` each run as a real, multi-tool-call agent session scoped to a shared workspace directory on disk — FE/BE/OPS can `Read`, `Write`, `Edit`, `Glob`, `Grep`, and run `Bash`; QA gets `Read`/`Glob`/`Grep`/`Bash` but deliberately *not* `Write`/`Edit` (full breakdown in [Security & access control](#security-access-control)). Code is written to real files. QA reads and *executes* those files instead of parsing pasted-in text — it verifies, it doesn't modify.
 
-Every one of the eight agents — including the four pure-reasoning roles (`product_manager`, `solution_architect`, `uat_reviewer`, `release_reporter`) — runs through the same `ClaudeCodeAgent` wrapper class (`src/aiteam/claude_code_agent.py`). The only difference is whether tools are enabled: the reasoning roles get `allowed_tools=[]` (no filesystem access at all), the engineering roles get real file/bash tools. This also means the entire pipeline authenticates through one mechanism — the `claude` CLI's own OAuth login — with no API key required anywhere.
+Every one of the eight agents — including the four pure-reasoning roles (`product_manager`, `solution_architect`, `uat_reviewer`, `release_reporter`) — runs through the same `ClaudeCodeAgent` wrapper class (`src/looper/claude_code_agent.py`). The only difference is whether tools are enabled: the reasoning roles get `allowed_tools=[]` (no filesystem access at all), the engineering roles get real file/bash tools. This also means the entire pipeline authenticates through one mechanism — the `claude` CLI's own OAuth login — with no API key required anywhere.
 
 **Context routing keeps prompts bounded.** Every Claude Code session starts with amnesia, so each agent replays its accumulated message history as the prompt on every turn — but GraphFlow broadcasts every message to every agent, and an unfiltered replay grows with the whole transcript: an engineer's rework prompt would re-send the other engineers' summaries and every superseded QA report alongside the current one (wasted tokens *and* a stale-context hazard). Each role's replayed prompt is therefore filtered (`context_sources` in `pipeline.py`) to exactly the artifacts its role spec declares as inputs, keeping only the latest version per source — an engineer sees the goal, the latest TECH DESIGN, and the latest QA report, nothing else.
 
@@ -92,7 +92,7 @@ USER GOAL
    └── UAT_APPROVED ──► [Release Reporter] ──► done
 ```
 
-Full role-by-role prompts and the formal orchestration spec are in [SPEC.md](SPEC.md); the implementation graph is `src/aiteam/pipeline.py`.
+Full role-by-role prompts and the formal orchestration spec are in [SPEC.md](SPEC.md); the implementation graph is `src/looper/pipeline.py`.
 
 ### Workspace layout
 
@@ -105,7 +105,7 @@ Each run gets one workspace directory (`output/workspace/<timestamp>/`), shared 
 | `workspace/` (root) | `devops_engineer` | Needs to reference `./frontend` and `./backend` in Dockerfiles/compose/CI |
 | `workspace/` (root) | `qa_engineer` (read/execute) | Needs to see and run everything FE/BE/OPS produced |
 
-This convention is encoded directly into the FE/BE/OPS/QA prompts (`src/aiteam/prompts.py` and `SPEC.md`, kept byte-identical on purpose) — the path names there and the directory assignment in `pipeline.py` have to stay in sync.
+This convention is encoded directly into the FE/BE/OPS/QA prompts (`src/looper/prompts.py` and `SPEC.md`, kept byte-identical on purpose) — the path names there and the directory assignment in `pipeline.py` have to stay in sync.
 
 ### Why this combination, specifically
 
@@ -162,7 +162,7 @@ Both are now fixed:
 
 - After every completed agent turn, `main.py` calls `GraphFlow.save_state()` and overwrites `output/checkpoints/<timestamp>.json` (goal, workspace path, full team state — including every agent's replay history via `ClaudeCodeAgent.save_state()`).
 - On any exception, the run stops and prints the checkpoint path.
-- `python -m aiteam.main --resume output/checkpoints/<timestamp>.json` rebuilds the team against the *same* workspace, loads the saved state, and continues with `run_stream(task=None)` — AutoGen's own mechanism for "continue the previous task."
+- `python -m looper.main --resume output/checkpoints/<timestamp>.json` rebuilds the team against the *same* workspace, loads the saved state, and continues with `run_stream(task=None)` — AutoGen's own mechanism for "continue the previous task."
 
 > **What resume does *not* give you:** recovery is per completed turn, not per tool call. If a turn is interrupted mid-session (like the quota hit did, inside a `frontend_engineer` session), resuming retries that *whole* turn from scratch — you don't get partial credit for tool calls already made inside a turn that never finished. What you don't lose is everything *before* that turn, and any files a previous, successfully-completed turn already wrote to the workspace.
 
@@ -189,7 +189,7 @@ claude auth status                          # confirm you're logged in
 
 ```sh
 export PYTHONPATH=src
-.venv/bin/python -m aiteam.main "Build a URL shortener with custom aliases and click analytics."
+.venv/bin/python -m looper.main "Build a URL shortener with custom aliases and click analytics."
 ```
 
 The run streams to the console and writes:
@@ -201,19 +201,19 @@ The run streams to the console and writes:
 If a run fails partway (Claude session/usage limit, a crash, anything), resume instead of starting over:
 
 ```sh
-.venv/bin/python -m aiteam.main --resume output/checkpoints/<timestamp>.json
+.venv/bin/python -m looper.main --resume output/checkpoints/<timestamp>.json
 ```
 
 ### Configuration
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `AITEAM_CODE_MODEL` | `sonnet` | Model override for all 8 agents. Default is `sonnet` (a CLI alias for the latest Sonnet model, verified via `claude --help`) rather than Claude Code's own default (typically Opus-tier) — cheaper/faster given how many real sessions one run consumes; set to `opus` or a specific model string for higher-judgment work. |
-| `AITEAM_OUTPUT_DIR` | `output` | Directory for transcripts, workspaces, and checkpoints |
+| `LOOPER_CODE_MODEL` | `sonnet` | Model override for all 8 agents. Default is `sonnet` (a CLI alias for the latest Sonnet model, verified via `claude --help`) rather than Claude Code's own default (typically Opus-tier) — cheaper/faster given how many real sessions one run consumes; set to `opus` or a specific model string for higher-judgment work. |
+| `LOOPER_OUTPUT_DIR` | `output` | Directory for transcripts, workspaces, and checkpoints |
 
-`AITEAM_PROVIDER` / `AITEAM_MODEL` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in `.env.example` are **not used by default**. They're read only by `src/aiteam/config.py`, which is currently unwired dead code, kept intentionally in case the pipeline is ever pointed back at a raw-API-key provider (`AnthropicChatCompletionClient`/`OpenAIChatCompletionClient` via `autogen-ext`) instead of the `claude` CLI. Setting them has no effect on a normal run.
+`LOOPER_PROVIDER` / `LOOPER_MODEL` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in `.env.example` are **not used by default**. They're read only by `src/looper/config.py`, which is currently unwired dead code, kept intentionally in case the pipeline is ever pointed back at a raw-API-key provider (`AnthropicChatCompletionClient`/`OpenAIChatCompletionClient` via `autogen-ext`) instead of the `claude` CLI. Setting them has no effect on a normal run.
 
-Per-role turn budgets are set in `src/aiteam/pipeline.py` (not env-configurable today). The four reasoning roles are capped at 3 turns — they never call a tool, so this is just a runaway guard, not a working budget. The four engineering roles start at a static default of 20, then get **dynamically resized** once `solution_architect` produces its TECH DESIGN: the architect estimates how many turns FE/BE/OPS will each realistically need for their tagged tasks (its prompt's "Turn Budget Estimate" section), and `apply_turn_budget_from_architect()` parses and applies that estimate via `ClaudeCodeAgent.set_max_turns()` before their turn runs — see [How it works](#how-it-works) for why this exists and what it fixed. Every tool-using role's system prompt states its *current* budget explicitly (`self._max_turns`, whatever it is at that point), so the agent knows to pace itself instead of discovering the ceiling by hitting it. Estimates are clamped to `[MIN_ENGINEER_TURNS, MAX_ENGINEER_TURNS]` = `[8, 50]` so one miscalibrated number can't starve a role or blow the run's cost.
+Per-role turn budgets are set in `src/looper/pipeline.py` (not env-configurable today). The four reasoning roles are capped at 3 turns — they never call a tool, so this is just a runaway guard, not a working budget. The four engineering roles start at a static default of 20, then get **dynamically resized** once `solution_architect` produces its TECH DESIGN: the architect estimates how many turns FE/BE/OPS will each realistically need for their tagged tasks (its prompt's "Turn Budget Estimate" section), and `apply_turn_budget_from_architect()` parses and applies that estimate via `ClaudeCodeAgent.set_max_turns()` before their turn runs — see [How it works](#how-it-works) for why this exists and what it fixed. Every tool-using role's system prompt states its *current* budget explicitly (`self._max_turns`, whatever it is at that point), so the agent knows to pace itself instead of discovering the ceiling by hitting it. Estimates are clamped to `[MIN_ENGINEER_TURNS, MAX_ENGINEER_TURNS]` = `[8, 50]` so one miscalibrated number can't starve a role or blow the run's cost.
 
 ---
 
@@ -233,7 +233,7 @@ Open `http://localhost:5173`, create an account, and start a run.
 
 ### How it's wired
 
-- **`server/`** (FastAPI) is a thin control plane around the pipeline, not a reimplementation of it. `server/pipeline_runner.py` calls the same `build_team()` from `src/aiteam/pipeline.py`, passing an `on_event` callback that `ClaudeCodeAgent` fires on `turn_started`/`tool_call`/`turn_completed`/`error` (added to `claude_code_agent.py` for exactly this). Each event is written to SQLite (`Run`, `RunEvent` in `server/models.py`) and published to an in-process pub/sub broker (`server/events.py`). `GET /runs/{id}/events` is a Server-Sent Events endpoint the frontend subscribes to — it replays an SSE-safe JSON view of a run's event history on connect, then streams live events until the run finishes.
+- **`server/`** (FastAPI) is a thin control plane around the pipeline, not a reimplementation of it. `server/pipeline_runner.py` calls the same `build_team()` from `src/looper/pipeline.py`, passing an `on_event` callback that `ClaudeCodeAgent` fires on `turn_started`/`tool_call`/`turn_completed`/`error` (added to `claude_code_agent.py` for exactly this). Each event is written to SQLite (`Run`, `RunEvent` in `server/models.py`) and published to an in-process pub/sub broker (`server/events.py`). `GET /runs/{id}/events` is a Server-Sent Events endpoint the frontend subscribes to — it replays an SSE-safe JSON view of a run's event history on connect, then streams live events until the run finishes.
 - **`web/`** (React + Vite + TypeScript) has three pages: sign in/up, a run list with a "start a new run" form, and the Run Floor — a fixed-layout schematic mirroring `pipeline.py`'s actual graph shape (the PM → Architect → {FE, BE, OPS} → QA → UAT → Reporter spine, with the `QA_FAIL` rework loop and `UAT_REJECTED` re-scope loop drawn as their own channels), plus a terminal-style activity log, both driven live by the SSE stream.
 - Auth is a normal JWT (signup/login issue a bearer token). The one deliberate deviation: `/runs/{id}/events` accepts the token as a `?token=` query parameter instead of an `Authorization` header, because a browser's native `EventSource` can't set custom headers — a known, documented tradeoff (URL-borne tokens can leak into logs/browser history) that's fine for a local/trusted deployment and worth revisiting before anything public-facing.
 - The pipeline's own on-disk state — the per-run workspace and `output/checkpoints/<stamp>.json` — is still the real source of truth for a run's code and for resuming it; the web UI's SQLite database only tracks *who owns which run* and *the live event feed*, and does not replace or duplicate that state.
@@ -249,7 +249,7 @@ Named explicitly so they're not mistaken for the finished state:
 - **Shared Claude Code login.** Every user of the web app spends against the *same host's* `claude auth login` session — there is no per-user Claude billing or quota isolation. Fine for one person or a trusted team on one machine; wrong for a multi-tenant deployment.
 - **SQLite + in-process pub/sub, single process only.** `server/db.py` defaults to a local SQLite file; `server/events.py`'s broker is an in-memory `dict` of queues. Both are documented in-file as single-process-only — a multi-worker deployment would need Postgres and a real message bus (e.g. Redis pub/sub) instead.
 - **No refresh-token rotation.** JWTs are long-lived (7 days, `server/auth.py`) with no revocation mechanism.
-- **`AITEAM_JWT_SECRET` defaults to an insecure value** with a startup warning printed to the console — set a real secret via env var before running this anywhere but localhost.
+- **`LOOPER_JWT_SECRET` defaults to an insecure value** with a startup warning printed to the console — set a real secret via env var before running this anywhere but localhost.
 - **No resume-from-the-UI yet.** A run that fails mid-flight still leaves a valid checkpoint (see [Checkpoint & resume](#checkpoint-resume)), but re-running it today means going back to `main.py --resume` from a terminal — wiring that into a "Resume" button in the run list is a natural next step, not something ruled out.
 
 ---
@@ -259,12 +259,12 @@ Named explicitly so they're not mistaken for the finished state:
 | File | What's there |
 |---|---|
 | `SPEC.md` | The authoritative behavior spec: full role prompts, orchestration rules, design rationale. Kept in lockstep with `prompts.py`. |
-| `src/aiteam/prompts.py` | Global rules + the 8 role system prompts, verbatim from `SPEC.md` section 3. |
-| `src/aiteam/pipeline.py` | The `GraphFlow` graph: fan-out/fan-in, conditional rework edges, per-role turn budgets, workspace directory assignment. |
-| `src/aiteam/claude_code_agent.py` | `ClaudeCodeAgent`, the `BaseChatAgent` every role runs as: a real `claude_agent_sdk` session, with or without tool access, a `PreToolUse` permission guard, and `save_state()`/`load_state()` for checkpoint/resume. |
-| `src/aiteam/termination.py` | `TokenCountTermination`, the QA-fail counter that hard-stops a run with `PIPELINE_FAILED` after 3 rework loops. |
-| `src/aiteam/main.py` | CLI entry point: run/resume, per-turn checkpointing, transcript writing. |
-| `src/aiteam/config.py` | Unused: a provider-configurable AutoGen model client, kept for a possible future raw-API-key path (see [Configuration](#configuration)). |
+| `src/looper/prompts.py` | Global rules + the 8 role system prompts, verbatim from `SPEC.md` section 3. |
+| `src/looper/pipeline.py` | The `GraphFlow` graph: fan-out/fan-in, conditional rework edges, per-role turn budgets, workspace directory assignment. |
+| `src/looper/claude_code_agent.py` | `ClaudeCodeAgent`, the `BaseChatAgent` every role runs as: a real `claude_agent_sdk` session, with or without tool access, a `PreToolUse` permission guard, and `save_state()`/`load_state()` for checkpoint/resume. |
+| `src/looper/termination.py` | `TokenCountTermination`, the QA-fail counter that hard-stops a run with `PIPELINE_FAILED` after 3 rework loops. |
+| `src/looper/main.py` | CLI entry point: run/resume, per-turn checkpointing, transcript writing. |
+| `src/looper/config.py` | Unused: a provider-configurable AutoGen model client, kept for a possible future raw-API-key path (see [Configuration](#configuration)). |
 | `CLAUDE.md` | Instructions and invariants for AI coding agents working on this repo (activation-group deadlock gotcha, verdict-token matching rules, etc.) — read it before changing orchestration code. |
 | `tests/` | Orchestration tests against a scripted mock — see [Testing](#testing) below. |
 | `server/` | FastAPI control-plane API for the [Web UI](#web-ui) — auth, run creation, SSE event streaming. Calls `build_team()` from `pipeline.py`; doesn't reimplement it. |
@@ -335,7 +335,7 @@ This was built the way it was for a specific, verified reason: the SDK's own `ca
 This section exists on purpose. It's easy to write a README that only sells the idea; here's what's actually true about the current state of this project.
 
 - **No published benchmark.** Everything in [Evidence this works](#evidence-this-works-not-just-theory) came from a handful of real runs during development — it demonstrates the *mechanism* works (QA can catch real bugs it couldn't otherwise catch, resume genuinely resumes), not that output quality is measured or competitive with anything. Treat claims here as "verified to occur at least once," not "proven at scale."
-- **Cost and quota are unpredictable, and can be significant.** Every engineering turn is a full agentic Claude Code session — potentially dozens of tool calls — and rework loops multiply that (one QA_FAIL can re-run three engineers). We hit the account's Claude Code session/usage limit mid-testing during development. Two mitigations are already in place by default: context routing (see [How it works](#how-it-works)) bounds each turn's replayed prompt to the role's declared inputs, and every agent defaults to `AITEAM_CODE_MODEL=sonnet` rather than Claude Code's own (typically Opus-tier) default. Further mitigations, in order of effort: lower the per-role `max_turns` in `pipeline.py`; or, more structurally, note that `product_manager`/`solution_architect`/`uat_reviewer`/`release_reporter` don't use any tools but still each spin up a full `claude` CLI session just to produce one text completion — moving only those four roles to a raw metered API call (e.g. reviving `config.py`) would cut Claude Code session-quota consumption roughly in half without touching the real-execution value the engineering roles provide. See [Possible future work](#possible-future-work).
+- **Cost and quota are unpredictable, and can be significant.** Every engineering turn is a full agentic Claude Code session — potentially dozens of tool calls — and rework loops multiply that (one QA_FAIL can re-run three engineers). We hit the account's Claude Code session/usage limit mid-testing during development. Two mitigations are already in place by default: context routing (see [How it works](#how-it-works)) bounds each turn's replayed prompt to the role's declared inputs, and every agent defaults to `LOOPER_CODE_MODEL=sonnet` rather than Claude Code's own (typically Opus-tier) default. Further mitigations, in order of effort: lower the per-role `max_turns` in `pipeline.py`; or, more structurally, note that `product_manager`/`solution_architect`/`uat_reviewer`/`release_reporter` don't use any tools but still each spin up a full `claude` CLI session just to produce one text completion — moving only those four roles to a raw metered API call (e.g. reviving `config.py`) would cut Claude Code session-quota consumption roughly in half without touching the real-execution value the engineering roles provide. See [Possible future work](#possible-future-work).
 - **Single-vendor lock-in.** The entire pipeline authenticates via the `claude` CLI specifically, with no fallback wired in. If Claude Code's plan limits, pricing, or CLI behavior change, there's no alternate path today (`config.py` exists as a starting point for one, but it's disconnected).
 - **Crash recovery is per-turn, not per-tool-call.** See [Checkpoint & resume](#checkpoint-resume) — a turn interrupted mid-session is retried wholesale on resume, not resumed from its last tool call.
 - **`--resume` has no lock against running it twice on the same checkpoint.** Confirmed live (see [Evidence this works](#evidence-this-works-not-just-theory)): two overlapping `--resume` invocations against the same checkpoint file ran concurrently against the same workspace for several minutes with neither aware of the other, because nothing prevents it. The specific case recovered without actual file corruption, but that was fortunate, not guaranteed by the tooling. Always verify (via `ps`, not just printed output) that an earlier invocation has fully exited before starting another one against the same checkpoint.
@@ -349,7 +349,7 @@ This section exists on purpose. It's easy to write a README that only sells the 
 
 ### How this compares to similar projects
 
-The closest prior art is **[MetaGPT](https://github.com/FoundationAgents/MetaGPT)** — same role decomposition in spirit (Product Manager → Architect → Project Manager → Engineer → QA Engineer), same philosophy of structured document handoffs over free-form dialogue, and it has published benchmark numbers (85.9%/87.7% Pass@1 on standard coding benchmarks) and years of real usage that AiTeam does not have. It differs in two important ways: it's a bespoke orchestration engine rather than AutoGen, and its execution/testing capability is its own built-in interpreter rather than a full agentic coding tool like Claude Code — meaningfully less capable at the kind of real, autonomous, many-tool-call verification this project's QA role depends on.
+The closest prior art is **[MetaGPT](https://github.com/FoundationAgents/MetaGPT)** — same role decomposition in spirit (Product Manager → Architect → Project Manager → Engineer → QA Engineer), same philosophy of structured document handoffs over free-form dialogue, and it has published benchmark numbers (85.9%/87.7% Pass@1 on standard coding benchmarks) and years of real usage that Looper does not have. It differs in two important ways: it's a bespoke orchestration engine rather than AutoGen, and its execution/testing capability is its own built-in interpreter rather than a full agentic coding tool like Claude Code — meaningfully less capable at the kind of real, autonomous, many-tool-call verification this project's QA role depends on.
 
 ChatDev is a similar-genre "AI software company" simulation with dialogue-driven agent communication — also its own framework, predating the Claude Agent SDK.
 

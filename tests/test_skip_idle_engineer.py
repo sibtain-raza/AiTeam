@@ -33,8 +33,8 @@ from unittest import mock
 from autogen_agentchat.messages import TextMessage
 from autogen_core import CancellationToken
 
-from aiteam import claude_code_agent as cca
-from aiteam.claude_code_agent import ClaudeCodeAgent
+from looper import claude_code_agent as cca
+from looper.claude_code_agent import ClaudeCodeAgent
 
 
 def make_agent(name: str, cwd: Path, max_turns: int, allowed_tools=None) -> ClaudeCodeAgent:
@@ -51,7 +51,7 @@ def make_agent(name: str, cwd: Path, max_turns: int, allowed_tools=None) -> Clau
 
 class SkipIdleEngineerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.workspace_dir = Path(tempfile.mkdtemp(prefix="aiteam_skip_test_"))
+        self.workspace_dir = Path(tempfile.mkdtemp(prefix="looper_skip_test_"))
 
     def tearDown(self) -> None:
         shutil.rmtree(self.workspace_dir, ignore_errors=True)
