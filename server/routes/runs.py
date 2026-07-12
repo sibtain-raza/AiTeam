@@ -11,7 +11,8 @@ from ..db import get_db
 from ..deps import get_current_user, get_current_user_sse
 from ..events import broker
 from ..models import Run, RunEvent, RunStatus, User
-from ..pipeline_runner import OUTPUT_DIR, run_pipeline
+from .. import pipeline_runner
+from ..pipeline_runner import run_pipeline
 from ..schemas import CreateRunRequest, RunEventOut, RunSummary
 
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -37,8 +38,11 @@ async def create_run(
     user: User = Depends(get_current_user),
 ) -> RunSummary:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    workspace = OUTPUT_DIR / "workspace" / stamp
-    checkpoint_path = OUTPUT_DIR / "checkpoints" / f"{stamp}.json"
+    # Read via the module attribute (not an import-time copy) so tests can
+    # patch server.pipeline_runner.OUTPUT_DIR to a temp dir and have it
+    # take effect here too.
+    workspace = pipeline_runner.OUTPUT_DIR / "workspace" / stamp
+    checkpoint_path = pipeline_runner.OUTPUT_DIR / "checkpoints" / f"{stamp}.json"
 
     run = Run(
         owner_id=user.id,

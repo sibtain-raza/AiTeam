@@ -58,7 +58,7 @@ Two different techniques, combined in one pipeline:
 
 2. **The Claude Agent SDK drives *execution*** for the engineering roles. Instead of an LLM completion that inlines code as chat text, `frontend_engineer`, `backend_engineer`, `devops_engineer`, and `qa_engineer` each run as a real, multi-tool-call agent session scoped to a shared workspace directory on disk — FE/BE/OPS can `Read`, `Write`, `Edit`, `Glob`, `Grep`, and run `Bash`; QA gets `Read`/`Glob`/`Grep`/`Bash` but deliberately *not* `Write`/`Edit` (full breakdown in [Security & access control](#security-access-control)). Code is written to real files. QA reads and *executes* those files instead of parsing pasted-in text — it verifies, it doesn't modify.
 
-Every one of the eight agents — including the four pure-reasoning roles (`product_manager`, `solution_architect`, `uat_reviewer`, `release_reporter`) — runs through the same `ClaudeCodeAgent` wrapper class (`src/looper/claude_code_agent.py`). The only difference is whether tools are enabled: the reasoning roles get `allowed_tools=[]` (no filesystem access at all), the engineering roles get real file/bash tools. This also means the entire pipeline authenticates through one mechanism — the `claude` CLI's own OAuth login — with no API key required anywhere.
+Every one of the nine agents — including the five pure-reasoning roles (`product_manager`, `scope_validator`, `solution_architect`, `uat_reviewer`, `release_reporter`) — runs through the same `ClaudeCodeAgent` wrapper class (`src/looper/claude_code_agent.py`). The only difference is whether tools are enabled: the reasoning roles get `allowed_tools=[]` (no filesystem access at all), the engineering roles get real file/bash tools. This also means the entire pipeline authenticates through one mechanism — the `claude` CLI's own OAuth login — with no API key required anywhere.
 
 **Context routing keeps prompts bounded.** Every Claude Code session starts with amnesia, so each agent replays its accumulated message history as the prompt on every turn — but GraphFlow broadcasts every message to every agent, and an unfiltered replay grows with the whole transcript: an engineer's rework prompt would re-send the other engineers' summaries and every superseded QA report alongside the current one (wasted tokens *and* a stale-context hazard). Each role's replayed prompt is therefore filtered (`context_sources` in `pipeline.py`) to exactly the artifacts its role spec declares as inputs, keeping only the latest version per source — an engineer sees the goal, the latest TECH DESIGN, and the latest QA report, nothing else.
 
@@ -71,6 +71,9 @@ USER GOAL
    │
    ▼
 [PM: Groom] ──► PRD (user stories, Given/When/Then acceptance criteria, NFRs)
+   │
+   ▼
+[Scope Validator] ──► SCOPE REVIEW (binding Must-Cut trim list — the anti-scope-inflation gate; always forwards)
    │
    ▼
 [Solution Architect] ──► TECH DESIGN (stack, interface contracts, task breakdown tagged FE/BE/OPS)
@@ -126,6 +129,70 @@ Every engineering turn has a budget (see [Configuration](#configuration) — dyn
 - **QA evaluates the real files on disk, not the chat message**, so an incomplete implementation surfaces the normal way: QA's own rule is explicit — *"An AC/NFR with no implementing code is an automatic failure."* A turn that ran out of budget doesn't get special-cased; it's judged exactly like a genuine bug would be.
 - **The "penalty," such as it is, is the existing QA rework loop — not a separate mechanism.** `QA_FAIL` routes back to the owning engineer(s) with a **fresh full turn budget**, not a reduced one, and the engineer resumes from the files it already wrote rather than starting over. This is closer to a real team's code-review-and-fix cycle than a rejection.
 - **It's bounded, the same way a real team's patience is.** Only 3 `QA_FAIL` loops are allowed (`MAX_QA_LOOPS`) before the whole run hard-stops with `PIPELINE_FAILED` — repeatedly running out of turns doesn't get infinite extra attempts.
+
+### Flow diagrams
+
+Three flows are hard to reconstruct from prose alone — the ones that produced real incidents. Sequence diagrams for each (rendered by GitHub natively):
+
+**QA rework loop** — verdict-token routing, and why only the owning engineers re-run:
+
+```mermaid
+sequenceDiagram
+    participant A as solution_architect
+    participant FE as frontend_engineer
+    participant BE as backend_engineer
+    participant OPS as devops_engineer
+    participant QA as qa_engineer
+    participant UAT as uat_reviewer
+    A->>FE: TECH DESIGN (fan-out, parallel)
+    A->>BE: TECH DESIGN
+    A->>OPS: TECH DESIGN
+    FE->>QA: FE IMPLEMENTATION (fan-in: QA waits for all 3)
+    BE->>QA: BE IMPLEMENTATION
+    OPS->>QA: OPS IMPLEMENTATION
+    QA->>QA: read files, run builds/tests
+    alt last line is QA_FAIL (max 3, then PIPELINE_FAILED)
+        QA->>BE: QA REPORT (defects tagged [BE] — every engineer re-runs<br/>via the shared rework edge, but prompts scope fixes to own tags)
+        BE->>QA: fixes, re-verify
+    else last line is QA_PASS
+        QA->>UAT: QA REPORT
+    end
+```
+
+**Crash mid-fan-out and `--resume`** — why recovery needs `turn_in_progress` + `recover_stuck_agents()`, not just `load_state()`:
+
+```mermaid
+sequenceDiagram
+    participant GM as GraphManager
+    participant OPS as devops_engineer
+    participant CP as checkpoint JSON
+    participant R as resumed process
+    GM->>OPS: select_speaker() — clears OPS's "ready" bookkeeping IMMEDIATELY,<br/>before the agent runs
+    OPS->>OPS: turn_in_progress = true
+    OPS--xOPS: session crashes (e.g. account session limit)
+    Note over CP: GraphFlow's own state has no<br/>"dispatched but unfinished" concept —<br/>OPS looks done. turn_in_progress<br/>(saved by ClaudeCodeAgent.save_state)<br/>is the only surviving evidence.
+    R->>CP: read checkpoint
+    R->>R: recover_stuck_agents(): any agent with<br/>turn_in_progress → re-append to GraphManager's ready list
+    R->>GM: load_state() + run_stream(task=None)
+    GM->>OPS: re-dispatched; message_buffer still holds its inputs<br/>(only cleared on SUCCESSFUL completion)
+```
+
+**Engineer hits `max_turns`** — graceful degradation instead of a dead run, plus the SDK's double-raise quirk:
+
+```mermaid
+sequenceDiagram
+    participant E as engineer agent
+    participant SDK as claude_agent_sdk
+    participant QA as qa_engineer
+    E->>SDK: query(max_turns=N)
+    SDK->>E: ResultMessage(subtype="error_max_turns")
+    Note over E: not a crash: transcript becomes the message,<br/>turn completes; _last_hit_max_turns = true
+    SDK--xE: SECOND raw Exception on the next async-for iteration<br/>(CLI exits non-zero "for shell-script consumers") —<br/>swallowed only because hit_max_turns is set
+    E->>QA: message prefixed with a truncation WARNING banner<br/>(the narration may describe unfinished work)
+    QA->>QA: judges the real files on disk → typically QA_FAIL
+    QA->>E: rework turn
+    Note over E: budget auto-bumped +50% (clamped to 50)<br/>before the next session starts —<br/>never re-handed a budget that already proved too small
+```
 
 ---
 
@@ -208,8 +275,12 @@ If a run fails partway (Claude session/usage limit, a crash, anything), resume i
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `LOOPER_CODE_MODEL` | `sonnet` | Model override for all 8 agents. Default is `sonnet` (a CLI alias for the latest Sonnet model, verified via `claude --help`) rather than Claude Code's own default (typically Opus-tier) — cheaper/faster given how many real sessions one run consumes; set to `opus` or a specific model string for higher-judgment work. |
+| `LOOPER_CODE_MODEL` | `sonnet` | Model override for all 9 agents. Default is `sonnet` (a CLI alias for the latest Sonnet model, verified via `claude --help`) rather than Claude Code's own default (typically Opus-tier) — cheaper/faster given how many real sessions one run consumes; set to `opus` or a specific model string for higher-judgment work. |
+| `LOOPER_CODE_MODEL_<AGENT_NAME>` | — | Per-role override beating the global, e.g. `LOOPER_CODE_MODEL_RELEASE_REPORTER=haiku`. Reasoning turns are only ~7% of a measured real run's cost, and PM/architect quality steers everything downstream — the safe downgrades are `RELEASE_REPORTER` and `UAT_REVIEWER`. |
+| `LOOPER_MAX_PARALLEL_SESSIONS` | unbounded | Cap concurrent Claude Code sessions across the team (only the FE/BE/OPS fan-out exceeds one). Set `1`–`2` if parallel sessions trip your account-wide session limit mid-run. |
 | `LOOPER_OUTPUT_DIR` | `output` | Directory for transcripts, workspaces, and checkpoints |
+
+**Visual QA** (no env var — architect-decided per goal): most goals get `VISUAL_QA: NO` from the architect and QA does its normal code-only review. For a goal with real custom animation/interaction design, the architect can instead grant QA extra turns to build the app, drive it with Playwright, and `Read` back screenshots to catch layout/rendering defects a text-only review can't. This is a real render-and-look step, but it's still a frozen-frame/short-clip check — it cannot judge subjective "feel," smoothness, or animation polish, and QA's own report says so rather than overclaiming it.
 
 `LOOPER_PROVIDER` / `LOOPER_MODEL` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in `.env.example` are **not used by default**. They're read only by `src/looper/config.py`, which is currently unwired dead code, kept intentionally in case the pipeline is ever pointed back at a raw-API-key provider (`AnthropicChatCompletionClient`/`OpenAIChatCompletionClient` via `autogen-ext`) instead of the `claude` CLI. Setting them has no effect on a normal run.
 
@@ -219,7 +290,7 @@ Per-role turn budgets are set in `src/looper/pipeline.py` (not env-configurable 
 
 ## Web UI
 
-Everything above also runs from a browser instead of a terminal: sign up, submit a goal, and watch all eight agents work in real time on a schematic of the actual pipeline graph — no `PYTHONPATH`, no tailing a transcript file. It's a control plane on top of the same `build_team()` the CLI uses, not a different or cheaper execution path: a run started from the web UI spends exactly the same real Claude Code session quota as one started from `main.py`.
+Everything above also runs from a browser instead of a terminal: sign up, submit a goal, and watch all nine agents work in real time on a schematic of the actual pipeline graph — no `PYTHONPATH`, no tailing a transcript file. It's a control plane on top of the same `build_team()` the CLI uses, not a different or cheaper execution path: a run started from the web UI spends exactly the same real Claude Code session quota as one started from `main.py`.
 
 ```sh
 # Terminal 1 — backend (FastAPI)
@@ -308,7 +379,7 @@ Not every role gets the same tools, and the tools that are granted are further r
 | `frontend_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/frontend/` | Can install deps and self-verify (run its own build/tests) via Bash. |
 | `backend_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/backend/` | Same. |
 | `devops_engineer` | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | `workspace/` (root) | Needs root access to write Dockerfiles/compose/CI referencing `./frontend` and `./backend`. |
-| `qa_engineer` | `Read`, `Glob`, `Grep`, `Bash` — **no `Write`/`Edit`** | *(read-only, with a caveat)* | Genuinely cannot call `Write`/`Edit` now. But it still has `Bash`, and Bash can replicate file-writing (`echo ... > file`) — verified live: asked to write a file, it correctly refused `Write`, then *offered* to do the same thing via `Bash` instead. QA needs Bash for real test/build execution, so this isn't a bug to trivially fix — see the caveat below the table. |
+| `qa_engineer` | `Read`, `Glob`, `Grep`, `Bash` — **no `Write`/`Edit`** | *(read-only, with a caveat)* | Genuinely cannot call `Write`/`Edit` now. But it still has `Bash`, and Bash can replicate file-writing (`echo ... > file`) — verified live: asked to write a file, it correctly refused `Write`, then *offered* to do the same thing via `Bash` instead. QA needs Bash for real test/build execution, so this isn't a bug to trivially fix — see the caveat below the table. Same two tools also carry QA's optional visual verification pass (build the app, run Playwright via `Bash`, `Read` the resulting screenshots) — no new tool grant needed; see [Configuration](#configuration)'s Visual QA note. |
 
 ### The permission guard
 

@@ -28,11 +28,13 @@ import httpx
 
 from server.app import app
 from server.db import Base, engine, init_db
+import server.pipeline_runner as pipeline_runner_module
 import server.routes.runs as runs_module
 from tests.mock_agent import ScriptedClaudeCodeAgent, set_script
 
 BASE_SCRIPT = {
     "product_manager": ["# PRD\nDone.\n"],
+    "scope_validator": ["# SCOPE REVIEW\n## Verdict\nPROPORTIONATE\n## Must-Cut Items\n(none)\n"],
     "solution_architect": ["# TECH DESIGN\n## Task Breakdown\nT-1 [FE]\nT-2 [BE]\nT-3 [OPS]\n"],
     "frontend_engineer": ["# FE IMPLEMENTATION\nDone.\n"],
     "backend_engineer": ["# BE IMPLEMENTATION\nDone.\n"],
@@ -52,6 +54,19 @@ class ServerE2ETest(unittest.IsolatedAsyncioTestCase):
         init_db()
 
         set_script(BASE_SCRIPT)
+
+        # Point ALL run output (workspaces, checkpoints, cross-run memory)
+        # at a throwaway dir. Without this, scripted test runs wrote into
+        # the real ./output — and once cross-run memory landed, a test
+        # run's record would leak into the architect calibration hint used
+        # by real runs. Patched on pipeline_runner (routes/runs.py reads
+        # the module attribute, not an import-time copy).
+        from pathlib import Path
+
+        self._tmp_output = tempfile.TemporaryDirectory(prefix="looper_e2e_output_")
+        self._orig_output_dir = pipeline_runner_module.OUTPUT_DIR
+        pipeline_runner_module.OUTPUT_DIR = Path(self._tmp_output.name)
+
         self._orig_run_pipeline = runs_module.run_pipeline
 
         async def scripted_run_pipeline(run_id: str, goal: str):
@@ -64,6 +79,8 @@ class ServerE2ETest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         runs_module.run_pipeline = self._orig_run_pipeline
+        pipeline_runner_module.OUTPUT_DIR = self._orig_output_dir
+        self._tmp_output.cleanup()
         await self.client.aclose()
 
     async def test_signup_run_and_stream_events(self) -> None:

@@ -1,0 +1,50 @@
+# Looper API server (FastAPI control plane + the pipeline itself).
+#
+# Build from the REPO ROOT, not this directory:
+#   docker build -f deploy/Dockerfile.server -t looper-api .
+#
+# The pipeline shells out to the `claude` CLI (via claude-agent-sdk), so the
+# CLI is installed in the image — but its OAuth login CANNOT be baked in.
+# Mount an authenticated ~/.claude from the host at runtime (see
+# deploy/docker-compose.yml); without it the API serves fine but every run
+# fails at the first agent turn.
+# Pinned to a specific minor + distro (never :latest). For stricter
+# reproducibility, replace with an @sha256 digest from `docker pull`.
+FROM python:3.14-slim-bookworm
+
+# curl: HEALTHCHECK + the claude CLI installer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user with a real home — the claude CLI reads its auth from
+# ~/.claude, which docker-compose bind-mounts here.
+RUN useradd --create-home --uid 1000 looper
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# The claude CLI (native binary installer; no Node needed). Installed as the
+# runtime user so it lands under /home/looper and is on that user's PATH.
+USER looper
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/looper/.local/bin:${PATH}"
+
+USER root
+COPY src/ src/
+COPY server/ server/
+RUN mkdir -p /app/data /app/output && chown -R looper:looper /app
+USER looper
+
+ENV PYTHONPATH=/app/src \
+    PYTHONUNBUFFERED=1 \
+    LOOPER_DB_URL=sqlite:////app/data/looper_web.db \
+    LOOPER_OUTPUT_DIR=/app/output
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
+
+CMD ["python", "-m", "uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8000"]

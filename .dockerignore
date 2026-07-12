@@ -1,0 +1,10 @@
+# Build context hygiene for deploy/Dockerfile.* (built from repo root).
+.git
+.venv
+__pycache__
+*.pyc
+output/
+web/node_modules/
+web/dist/
+*.db
+.env

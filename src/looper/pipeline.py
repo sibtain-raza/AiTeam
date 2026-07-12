@@ -1,11 +1,13 @@
 """GraphFlow pipeline: PM → Architect → (FE ∥ BE ∥ OPS) → QA → UAT, with rework loops."""
 
+import asyncio
+import os
 import re
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from autogen_agentchat.conditions import MaxMessageTermination
-from autogen_agentchat.messages import BaseChatMessage
+from autogen_agentchat.messages import BaseChatMessage, TextMessage
 from autogen_agentchat.teams import DiGraphBuilder, GraphFlow
 
 from .claude_code_agent import ClaudeCodeAgent, OnEvent
@@ -18,6 +20,7 @@ from .prompts import (
     PM_PROMPT,
     QA_PROMPT,
     REPORTER_PROMPT,
+    SCOPE_VALIDATOR_PROMPT,
     UAT_PROMPT,
 )
 from .termination import TokenCountTermination, last_line
@@ -34,6 +37,13 @@ MAX_MESSAGES = 40
 # Dockerfile/.dockerignore conventions treat it as metadata, not app code.
 ARTIFACT_DIR_NAME = ".pipeline-docs"
 
+# Every real claude_agent_sdk call any agent makes, across the whole run —
+# one JSON line per turn (prompt sent, response received, cost/duration,
+# or the error if the session failed) — lives alongside the other
+# per-run artifacts under the same dot-prefixed dir. See
+# ClaudeCodeAgent._log_interaction() for the entry format.
+SDK_LOG_FILE_NAME = "sdk-interactions.jsonl"
+
 # Bounds for the architect's per-engineer turn-budget estimate (see
 # ARCHITECT_PROMPT's "Turn Budget Estimate" section and
 # apply_turn_budget_from_architect() below). Clamping protects both ends:
@@ -44,8 +54,19 @@ ARTIFACT_DIR_NAME = ".pipeline-docs"
 MIN_ENGINEER_TURNS = 8
 MAX_ENGINEER_TURNS = 50
 
+# Ceiling for the EXTRA turns a Visual QA pass (see ARCHITECT_PROMPT's
+# "Visual QA" section / apply_visual_qa_budget() below) can add to QA's
+# baseline QA_MAX_TURNS. QA's own render-and-screenshot workflow (build,
+# start a preview server, install/run Playwright, capture + Read several
+# images) is bounded work even for a highly animated frontend — this caps
+# a miscalibrated architect estimate the same way MAX_ENGINEER_TURNS caps
+# the per-engineer estimate above.
+MAX_VISUAL_QA_EXTRA_TURNS = 30
+
 _TURN_BUDGET_LINE = re.compile(r"^\s*(FE|BE|OPS)\s*:\s*(\d+)", re.MULTILINE)
 _TURN_BUDGET_ROLE_TO_AGENT = {"FE": "frontend_engineer", "BE": "backend_engineer", "OPS": "devops_engineer"}
+
+_VISUAL_QA_LINE = re.compile(r"VISUAL_QA\s*:\s*(YES|NO)\s*(?::\s*(\d+))?", re.IGNORECASE)
 
 
 def parse_turn_budget(text: str) -> dict[str, int]:
@@ -68,6 +89,52 @@ def parse_turn_budget(text: str) -> dict[str, int]:
         n = int(value)
         budget[role] = n if n == 0 else max(MIN_ENGINEER_TURNS, min(MAX_ENGINEER_TURNS, n))
     return budget
+
+
+def parse_visual_qa_extra_turns(text: str) -> int:
+    """Extract the architect's "## Visual QA" verdict from its TECH DESIGN
+    (format: a single `VISUAL_QA: YES: <N> — <reason>` or `VISUAL_QA: NO —
+    <reason>` line). Returns the extra tool-call turns to add to QA's
+    baseline budget — 0 for `NO`, a missing section, or a `YES` with no
+    parseable number (never silently grants extra turns without an
+    explicit count). Clamped to `[0, MAX_VISUAL_QA_EXTRA_TURNS]`.
+    """
+    match = _VISUAL_QA_LINE.search(text)
+    if match is None or match.group(1).upper() != "YES" or match.group(2) is None:
+        return 0
+    return max(0, min(MAX_VISUAL_QA_EXTRA_TURNS, int(match.group(2))))
+
+
+def apply_visual_qa_budget(
+    message: BaseChatMessage, agents: Mapping[str, ClaudeCodeAgent], base_turns: int
+) -> int:
+    """If `message` is solution_architect's TECH DESIGN and it requests
+    Visual QA, bump `qa_engineer`'s turn budget from `base_turns` (its
+    normal baseline — QA_MAX_TURNS at `build_team()` time, unless a prior
+    call already changed it) to `base_turns + <parsed extra>`, via the same
+    `set_max_turns()` seam `apply_turn_budget_from_architect()` uses for
+    FE/BE/OPS. Returns the extra amount applied (0 if not applicable) so a
+    caller can log it. No-op if `qa_engineer` is missing from `agents`.
+
+    Kept separate from `apply_turn_budget_from_architect()` rather than
+    folded into it: that function's contract is specifically "the Turn
+    Budget Estimate section, applied to FE/BE/OPS" and is unit-tested as
+    such — this is a different section of the same message governing a
+    different role, tested independently (see test_visual_qa.py) but
+    always called alongside it at the same call sites (main.py's live
+    on_message, its --resume path, and server/pipeline_runner.py) since
+    both are derived from the one architect message.
+    """
+    if message.source != "solution_architect":
+        return 0
+    extra = parse_visual_qa_extra_turns(message.to_text())
+    if extra == 0:
+        return 0
+    qa = agents.get("qa_engineer")
+    if qa is None:
+        return 0
+    qa.set_max_turns(base_turns + extra)
+    return extra
 
 
 def apply_turn_budget_from_architect(
@@ -93,6 +160,64 @@ def apply_turn_budget_from_architect(
         agent = agents.get(_TURN_BUDGET_ROLE_TO_AGENT[role])
         if agent is not None:
             agent.set_max_turns(n)
+    return budget
+
+
+def reapply_turn_budget_on_resume(
+    workspace: Path, agents: Mapping[str, ClaudeCodeAgent]
+) -> dict[str, int]:
+    """On `--resume`, re-derive the architect's per-engineer turn budget —
+    `set_max_turns()` overrides are pure in-memory state and don't survive
+    a fresh `build_team()` (only `_history` does, via `save_state()`).
+
+    Reads the architect's TECH DESIGN directly from its on-disk pointer
+    file (`<workspace>/.pipeline-docs/solution_architect.md`, written
+    unconditionally by `main.py`'s `on_message()` the instant the
+    architect's turn completes) rather than searching any specific
+    engineer's replayed `_history` for it (an earlier version of this did
+    exactly that, via a since-removed `find_message_from()` method).
+
+    That mattered because of a real, reproduced race, not a hypothetical
+    one: `on_messages()` only appends to `_history` when it is actually
+    CALLED — and if the checkpoint that ends up on disk was saved right
+    after the architect's turn but before GraphFlow had dispatched any
+    engineer's turn yet (plausible and observed live: checkpointing is
+    synchronous per completed message, while the FE/BE/OPS fan-out is
+    asynchronous and can crash — e.g. an account-wide Claude Code session
+    limit — before any of the three has been given its turn at all), then
+    NONE of the engineers' `_history` yet contains the architect's message,
+    so a lookup rooted in one specific agent's history silently found
+    nothing. The resumed run still correctly re-dispatched all three
+    engineers (GraphFlow's own state was self-consistent — nothing to
+    patch there), but every one of them silently reverted to the static
+    `ENGINEER_MAX_TURNS` default instead of the architect's real estimate.
+    Confirmed live: a run with a 38/38/22 FE/BE/OPS budget resumed after an
+    account session-limit crash and re-ran all three at the static default
+    of 20 — two of them then hit THAT ceiling too, on turns that had
+    already been proven to need more.
+
+    The on-disk pointer file has no equivalent race: `main.py` writes it
+    the moment the architect's message is produced, regardless of whether
+    any downstream agent has been dispatched yet. No-op (returns `{}`) if
+    the file doesn't exist (the architect hasn't completed a turn on this
+    checkpoint) or has no parseable budget section.
+
+    Also re-applies QA's Visual QA extra-turns budget (`apply_visual_qa_
+    budget()`) from the same on-disk design, for the identical reason —
+    that override is pure in-memory state too. Included in the returned
+    dict under the `"QA_VISUAL"` key when non-zero, alongside the FE/BE/OPS
+    keys, so callers can log everything re-applied in one line.
+    """
+    design_path = workspace / ARTIFACT_DIR_NAME / "solution_architect.md"
+    if not design_path.exists():
+        return {}
+    message = TextMessage(content=design_path.read_text(), source="solution_architect")
+    budget = apply_turn_budget_from_architect(message, agents)
+    qa = agents.get("qa_engineer")
+    if qa is not None:
+        visual_extra = apply_visual_qa_budget(message, agents, qa.max_turns)
+        if visual_extra:
+            budget["QA_VISUAL"] = visual_extra
     return budget
 
 
@@ -151,6 +276,69 @@ def recover_stuck_agents(team_state: dict) -> list[str]:
     return recovered
 
 
+def reset_pending_activation_flags(team_state: dict) -> list[str]:
+    """Patch a raw GraphFlow checkpoint dict so a node sitting in the
+    checkpointed `ready` queue can be re-dispatched into the SAME "any"
+    -semantics activation group again later — e.g. an engineer whose only
+    checkpointed dispatch was the architect's fan-out must still be
+    reachable by a later QA_FAIL rework edge sharing that group.
+
+    A second, deeper gap in AutoGen's own GraphFlow checkpointing, sibling
+    to the one `recover_stuck_agents()` fixes above but NOT the same bug —
+    read that docstring first. `GraphFlowManagerState` only clears an "any"
+    group's `enqueued_any` flag back to False inside `select_speaker()`, at
+    the exact instant a node is POPPED off `ready` for dispatch (see
+    `_reset_triggered_activation_groups()` in `_digraph_group_chat.py`) —
+    and that reset itself depends on `_triggered_activation_groups`, a
+    dict that ISN'T part of `save_state()`/`load_state()` at all. Looper's
+    own checkpointing (`main.py`'s `on_message()`) only fires once a
+    message is fully PRODUCED — so a checkpoint saved while a node is
+    still sitting in `ready` (added there, not yet popped) captures
+    `enqueued_any` still `True` for its group. `select_speaker()` would
+    have reset it moments later in the crashed process's now-lost memory,
+    but the checkpoint never saw that.
+
+    Confirmed live, not hypothetical: `frontend_engineer`/`backend
+    _engineer`/`devops_engineer` were all dispatched by the architect's
+    fan-out and started real Claude Code sessions (logged in
+    `sdk-interactions.jsonl`), then all three hit an account-wide session
+    limit before any completed — so the checkpoint that ended up on disk
+    pre-dates the dispatch-time bookkeeping update entirely. On `--resume`,
+    GraphFlow correctly re-ran all three (nothing wrong with `ready`
+    itself — this is why `recover_stuck_agents()` above found nothing:
+    `turn_in_progress` was still False for all three, since their crash
+    happened before ANY checkpoint captured them mid-turn). But with
+    `enqueued_any` still `True` for their groups, the later QA_FAIL edge's
+    `if not enqueued_any[...]` guard in `update_message_thread()` silently
+    swallowed the re-activation: none of the three engineers got a rework
+    turn, and the run printed "Digraph execution is complete" one QA_FAIL
+    into what should have been a 3-loop budget — `MAX_QA_LOOPS` never even
+    got a chance to matter.
+
+    Resets `enqueued_any[node][group] = False` for every group of every
+    node in `ready` (call after `recover_stuck_agents()`, so newly
+    -recovered nodes are covered too, before `team.load_state(team_state)`)
+    — exactly what `select_speaker()` would have done for them, performed
+    here instead since that in-memory update didn't survive the crash.
+    Safe even for a node whose flag is already False (a no-op) or that has
+    no "any" groups at all ("all"-semantics groups use `remaining`
+    instead, untouched by this). Returns `"node/group"` strings actually
+    flipped, purely for logging.
+    """
+    graph_manager = team_state.get("agent_states", {}).get("GraphManager")
+    if graph_manager is None:
+        return []
+    ready = graph_manager.get("ready", [])
+    enqueued_any = graph_manager.get("enqueued_any", {})
+    reset: list[str] = []
+    for node in ready:
+        for group, is_enqueued in enqueued_any.get(node, {}).items():
+            if is_enqueued:
+                enqueued_any[node][group] = False
+                reset.append(f"{node}/{group}")
+    return reset
+
+
 def verdict_is(token: str):
     """Edge condition: the source agent's final non-empty line is exactly `token`.
 
@@ -169,6 +357,8 @@ def build_team(
     workspace: Path,
     agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAgent,
     on_event: OnEvent | None = None,
+    architect_addendum: str | None = None,
+    output_dir: Path | None = None,
 ) -> tuple[GraphFlow, dict[str, ClaudeCodeAgent]]:
     """Build the pipeline. Every agent runs via a real claude_agent_sdk
     session authenticated through the `claude` CLI's own OAuth login — no
@@ -208,7 +398,37 @@ def build_team(
                                and QA can read/test everything); also the
                                cwd for the tool-less reasoning agents, who
                                never use it
+
+    `output_dir`, if given, is the CROSS-RUN parent directory (`workspace`
+    is one specific run's subdirectory under it — same relationship
+    `run_memory.py`'s `output_dir` has to a run's workspace). Used to point
+    `qa_engineer`'s `PLAYWRIGHT_BROWSERS_PATH` at `<output_dir>/.playwright
+    -browsers/` — a location that survives across every run, not just this
+    one — so the Chromium binary QA's Visual QA pass needs (see
+    QA_PROMPT step 4) is downloaded once and reused, instead of every run
+    (or every container restart, in the Dockerized deployment) re-fetching
+    it. None (the default) leaves QA's session to fall back on whatever
+    the host's own Playwright cache location resolves to — the SDK's
+    subprocess inherits the full host environment by default, so this
+    already often works by accident on a long-lived host, but isn't
+    guaranteed (an ephemeral container has no such implicit cache).
     """
+
+    sdk_log_path = workspace / ARTIFACT_DIR_NAME / SDK_LOG_FILE_NAME
+    qa_extra_env = (
+        {"PLAYWRIGHT_BROWSERS_PATH": str(output_dir / ".playwright-browsers")}
+        if output_dir is not None
+        else {}
+    )
+
+    # Parallel-session scheduler: LOOPER_MAX_PARALLEL_SESSIONS=N bounds how
+    # many real claude_agent_sdk sessions run concurrently across the whole
+    # team (the FE/BE/OPS fan-out is the only phase where more than one runs
+    # at once). Unset/0 = unbounded, the historical behavior. One semaphore
+    # shared by every agent — see ClaudeCodeAgent.__init__ for why this
+    # exists (account-wide session limits tripping mid-fan-out).
+    max_parallel = int(os.environ.get("LOOPER_MAX_PARALLEL_SESSIONS", "0") or 0)
+    session_limiter = asyncio.Semaphore(max_parallel) if max_parallel > 0 else None
 
     def code_agent(
         name: str,
@@ -219,6 +439,7 @@ def build_team(
         context_sources: dict[str, str],
         allowed_tools: Sequence[str] | None = None,
         pointer_files: dict[str, Path] | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> ClaudeCodeAgent:
         kwargs = {} if allowed_tools is None else {"allowed_tools": allowed_tools}
         return agent_cls(
@@ -230,6 +451,9 @@ def build_team(
             context_sources=context_sources,
             pointer_files=pointer_files,
             on_event=on_event,
+            sdk_log_path=sdk_log_path,
+            session_limiter=session_limiter,
+            extra_env=extra_env,
             **kwargs,
         )
 
@@ -280,13 +504,40 @@ def build_team(
         context_sources={"user": "all", "uat_reviewer": "latest"},
         allowed_tools=[],
     )
-    architect = code_agent(
-        "solution_architect",
-        "Turns the PRD into a production-grade technical design.",
-        ARCHITECT_PROMPT,
+    # `architect_addendum` is runtime-composed prompt context (e.g. the
+    # cross-run calibration hint from run_memory.calibration_hint()) — same
+    # pattern as the TURN BUDGET line ClaudeCodeAgent injects per turn. It
+    # deliberately does NOT edit ARCHITECT_PROMPT itself, so the
+    # prompts.py/SPEC.md sync rule is untouched.
+    architect_prompt = ARCHITECT_PROMPT
+    if architect_addendum:
+        architect_prompt = f"{ARCHITECT_PROMPT}\n\n{architect_addendum}"
+    # Annotate-only scope gate between PM and architect (see
+    # SCOPE_VALIDATOR_PROMPT / SPEC.md 3.1b): always forwards — enforcement
+    # is downstream prompts honoring its Must-Cut list (architect designs
+    # nothing for those items, QA marks them TRIMMED, UAT treats a wrong
+    # trim as re-scope grounds), NOT a reject loop back to PM. Chosen over
+    # a loop deliberately: no new activation groups, no loop-guard
+    # termination, no deadlock surface. Exists because scope inflation at
+    # the PM stage was a real, measured incident (a "beautiful car showroom
+    # website" goal ballooning into a $13 full-stack platform whose padded
+    # scope is also what ran the engineers out of their turn budgets).
+    scope_validator = code_agent(
+        "scope_validator",
+        "Independent proportionality check of the PRD against the original goal.",
+        SCOPE_VALIDATOR_PROMPT,
         cwd=workspace,
         max_turns=REASONING_MAX_TURNS,
         context_sources={"user": "all", "product_manager": "latest"},
+        allowed_tools=[],
+    )
+    architect = code_agent(
+        "solution_architect",
+        "Turns the PRD into a production-grade technical design.",
+        architect_prompt,
+        cwd=workspace,
+        max_turns=REASONING_MAX_TURNS,
+        context_sources={"user": "all", "product_manager": "latest", "scope_validator": "latest"},
         allowed_tools=[],
     )
     fe = code_agent(
@@ -325,6 +576,7 @@ def build_team(
         context_sources={
             "user": "all",
             "product_manager": "latest",
+            "scope_validator": "latest",
             "solution_architect": "latest",
             "frontend_engineer": "latest",
             "backend_engineer": "latest",
@@ -334,6 +586,9 @@ def build_team(
         # No Write/Edit: QA verifies and reports defects, it never modifies
         # the code it's independently checking — see README "Access per role".
         allowed_tools=["Read", "Glob", "Grep", "Bash"],
+        # Persistent cross-run Playwright browser cache (see build_team()'s
+        # docstring) — {} (no-op) when output_dir wasn't given.
+        extra_env=qa_extra_env,
     )
     uat = code_agent(
         "uat_reviewer",
@@ -344,6 +599,7 @@ def build_team(
         context_sources={
             "user": "all",
             "product_manager": "latest",
+            "scope_validator": "latest",
             "frontend_engineer": "latest",
             "backend_engineer": "latest",
             "devops_engineer": "latest",
@@ -371,10 +627,14 @@ def build_team(
     )
 
     builder = DiGraphBuilder()
-    for a in (pm, architect, fe, be, ops, qa, uat, reporter):
+    for a in (pm, scope_validator, architect, fe, be, ops, qa, uat, reporter):
         builder.add_node(a)
 
-    builder.add_edge(pm, architect)
+    # PM → scope gate → architect, both unconditional: the validator always
+    # forwards (annotate-only — see its construction above). On a UAT
+    # re-scope loop the re-groomed PRD passes back through the same gate.
+    builder.add_edge(pm, scope_validator)
+    builder.add_edge(scope_validator, architect)
 
     # Fan-out to engineers. Each engineer has two ways to activate — the
     # architect's design (first pass) or a QA_FAIL rework loop — so both
@@ -432,6 +692,7 @@ def build_team(
     )
     agents = {
         "product_manager": pm,
+        "scope_validator": scope_validator,
         "solution_architect": architect,
         "frontend_engineer": fe,
         "backend_engineer": be,

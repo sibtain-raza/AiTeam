@@ -1,0 +1,62 @@
+# Looper web control plane: API (FastAPI + the pipeline) and the built web
+# UI. Run from the REPO ROOT:
+#
+#   LOOPER_JWT_SECRET=$(openssl rand -hex 32) docker compose -f deploy/docker-compose.yml up --build
+#
+# Then open http://localhost:5173 (web UI); the API is on http://localhost:8000.
+#
+# HARD REQUIREMENT: the pipeline shells out to the `claude` CLI using its
+# OAuth login, which cannot be baked into an image or passed as an env var.
+# This compose bind-mounts your host's authenticated ~/.claude into the API
+# container (read-write — the CLI refreshes tokens). Log in on the host
+# first: `claude auth login`. Without the mount, runs fail at the first
+# agent turn while the rest of the API works normally.
+#
+# Scaling note (honest limits, not aspirations): one API replica only.
+# Run state (the SSE event broker, background run tasks) is in-process and
+# the default DB is a file-backed SQLite on a volume — replicate the API
+# container and live event streams will split-brain. Scaling past one node
+# means externalizing the broker and pointing LOOPER_DB_URL at a real
+# database first.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    ports:
+      - "8000:8000"
+    environment:
+      # Fails closed: no secret, no start — never ship the dev default.
+      LOOPER_JWT_SECRET: ${LOOPER_JWT_SECRET:?set LOOPER_JWT_SECRET (e.g. openssl rand -hex 32)}
+      LOOPER_CODE_MODEL: ${LOOPER_CODE_MODEL:-sonnet}
+      LOOPER_MAX_PARALLEL_SESSIONS: ${LOOPER_MAX_PARALLEL_SESSIONS:-0}
+      LOOPER_CORS_ORIGINS: ${LOOPER_CORS_ORIGINS:-http://localhost:5173}
+    volumes:
+      - looper-data:/app/data # SQLite DB
+      - looper-output:/app/output # workspaces, checkpoints, cross-run memory
+      - ${HOME}/.claude:/home/looper/.claude # claude CLI OAuth (see header)
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # Generous: one run spawns real engineer sessions (builds, tests).
+          memory: 2g
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      args:
+        # Must be browser-reachable (inlined into the JS bundle at build
+        # time) — the published API port above, not the container name.
+        VITE_API_BASE: ${LOOPER_PUBLIC_API_BASE:-http://localhost:8000}
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  looper-data:
+  looper-output:

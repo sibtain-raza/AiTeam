@@ -18,11 +18,13 @@ from pathlib import Path
 from autogen_agentchat.messages import TextMessage
 
 from looper.pipeline import (
+    ARTIFACT_DIR_NAME,
     MAX_ENGINEER_TURNS,
     MIN_ENGINEER_TURNS,
     apply_turn_budget_from_architect,
     build_team,
     parse_turn_budget,
+    reapply_turn_budget_on_resume,
 )
 
 from .mock_agent import ScriptedClaudeCodeAgent, set_script
@@ -140,11 +142,18 @@ class ApplyTurnBudgetTests(unittest.TestCase):
         self.assertEqual(agents["frontend_engineer"]._max_turns, before)
 
 
-class FindMessageFromTests(unittest.TestCase):
+class ReapplyTurnBudgetOnResumeTests(unittest.TestCase):
     """Backs the resume path in main.py: set_max_turns() overrides aren't
     captured by save_state()/load_state(), so a resumed run re-derives the
-    budget by finding the architect's message in an engineer's own history
-    (present there because context_sources includes solution_architect)."""
+    budget by reading the architect's TECH DESIGN back from its on-disk
+    pointer file. Reading from disk (rather than searching some specific
+    engineer's replayed `_history`, the previous approach) is what this
+    covers — a real, reproduced race showed the history-based version could
+    silently find nothing: `_history` is only populated when `on_messages()`
+    is actually called, and a checkpoint saved right after the architect's
+    turn but before ANY engineer had been dispatched left every engineer's
+    `_history` without the architect's message at all, even though
+    GraphFlow's own resume correctly re-ran all three."""
 
     def setUp(self) -> None:
         self.workspace_dir = Path(tempfile.mkdtemp(prefix="looper_budget_resume_test_"))
@@ -152,38 +161,44 @@ class FindMessageFromTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.workspace_dir, ignore_errors=True)
 
-    def test_finds_the_architect_message_in_engineer_history(self) -> None:
-        _team, agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
-        fe = agents["frontend_engineer"]
-        fe._history = [
-            TextMessage(content="goal text", source="user"),
-            TextMessage(content=ARCHITECT_TEXT_WITH_BUDGET, source="solution_architect"),
-        ]
-        found = fe.find_message_from("solution_architect")
-        assert found is not None
-        self.assertEqual(found.to_text(), ARCHITECT_TEXT_WITH_BUDGET)
+    def _write_design(self, text: str) -> None:
+        docs = self.workspace_dir / ARTIFACT_DIR_NAME
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / "solution_architect.md").write_text(text)
 
-    def test_returns_none_when_source_never_appeared(self) -> None:
+    def test_reapplies_budget_from_the_pointer_file(self) -> None:
         _team, agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
-        fe = agents["frontend_engineer"]
-        fe._history = [TextMessage(content="goal text", source="user")]
-        self.assertIsNone(fe.find_message_from("solution_architect"))
+        self._write_design(ARCHITECT_TEXT_WITH_BUDGET)
 
-    def test_resume_reapplies_budget_via_history(self) -> None:
-        """End-to-end version of the main.py resume path: parse+apply from
-        whatever find_message_from() returns, exactly as main.py does."""
-        _team, agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
-        for name in ("frontend_engineer", "backend_engineer", "devops_engineer"):
-            agents[name]._history = [TextMessage(content=ARCHITECT_TEXT_WITH_BUDGET, source="solution_architect")]
-
-        architect_message = agents["frontend_engineer"].find_message_from("solution_architect")
-        assert architect_message is not None
-        applied = apply_turn_budget_from_architect(architect_message, agents)
+        applied = reapply_turn_budget_on_resume(self.workspace_dir, agents)
 
         self.assertEqual(applied, {"FE": 18, "BE": 30, "OPS": 14})
         self.assertEqual(agents["frontend_engineer"]._max_turns, 18)
         self.assertEqual(agents["backend_engineer"]._max_turns, 30)
         self.assertEqual(agents["devops_engineer"]._max_turns, 14)
+
+    def test_works_even_when_no_engineer_history_has_the_design(self) -> None:
+        """The exact race this replaces the old approach for: none of the
+        engineers' _history contains the architect's message (on_messages()
+        was never called for any of them on this checkpoint), yet the
+        pointer file — written unconditionally the instant the architect's
+        turn completed — still has it."""
+        _team, agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        for name in ("frontend_engineer", "backend_engineer", "devops_engineer"):
+            self.assertEqual(agents[name]._history, [])
+        self._write_design(ARCHITECT_TEXT_WITH_BUDGET)
+
+        applied = reapply_turn_budget_on_resume(self.workspace_dir, agents)
+        self.assertEqual(applied, {"FE": 18, "BE": 30, "OPS": 14})
+
+    def test_no_pointer_file_is_a_no_op(self) -> None:
+        """Architect hasn't completed a turn on this checkpoint yet — must
+        not raise, must not touch any agent's budget."""
+        _team, agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        before = agents["frontend_engineer"]._max_turns
+        applied = reapply_turn_budget_on_resume(self.workspace_dir, agents)
+        self.assertEqual(applied, {})
+        self.assertEqual(agents["frontend_engineer"]._max_turns, before)
 
 
 if __name__ == "__main__":

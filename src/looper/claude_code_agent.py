@@ -7,8 +7,11 @@ inlining code as chat text. See SPEC.md section 3 for the role prompts and
 the workspace-directory convention this pairs with in pipeline.py.
 """
 
+import asyncio
+import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -29,6 +32,13 @@ from claude_agent_sdk import (
 from .termination import last_line
 
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+
+# Ceiling for the auto-bump applied when an engineer hit max_turns on its
+# previous real session (see _last_hit_max_turns below). Mirrors
+# pipeline.MAX_ENGINEER_TURNS — duplicated rather than imported to avoid a
+# circular import (pipeline.py imports this module, not the other way
+# around). Keep the two values in sync if either changes.
+_MAX_TURN_BUDGET = 50
 
 # QA/UAT MUST end their message in one of these tokens for GraphFlow's
 # conditional edges (verdict_is() in pipeline.py) to route anywhere — no
@@ -197,6 +207,9 @@ class ClaudeCodeAgent(BaseChatAgent):
         context_sources: Mapping[str, str] | None = None,
         pointer_files: Mapping[str, Path] | None = None,
         on_event: OnEvent | None = None,
+        sdk_log_path: Path | None = None,
+        session_limiter: "asyncio.Semaphore | None" = None,
+        extra_env: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(name, description=description)
         self._system_prompt = system_prompt
@@ -204,6 +217,11 @@ class ClaudeCodeAgent(BaseChatAgent):
         self._max_turns = max_turns
         self._allowed_tools = list(allowed_tools)
         self._history: list[BaseChatMessage] = []
+        # Every prompt sent to and response received from a real
+        # claude_agent_sdk session, appended as one JSON line per turn. None
+        # (tests' ScriptedClaudeCodeAgent, which never calls the real SDK)
+        # means no log is written — see _log_interaction()'s docstring.
+        self._sdk_log_path = sdk_log_path
         # True from the moment on_messages() accepts a turn until it returns
         # successfully. GraphFlow's own checkpoint has no concept of
         # "dispatched but not completed" — select_speaker() clears a node's
@@ -212,7 +230,53 @@ class ClaudeCodeAgent(BaseChatAgent):
         # docstring for the full story). This flag is how a resume detects
         # that gap and repairs it.
         self._turn_in_progress = False
-        self._model = os.environ.get("LOOPER_CODE_MODEL", DEFAULT_MODEL)
+        # True when this agent's most recent real session ended by hitting
+        # max_turns (see on_messages()'s error_max_turns handling below).
+        # Consulted — and cleared — at the start of the next on_messages()
+        # call so a rework turn doesn't get handed the exact same budget
+        # that already proved insufficient. Not part of save_state() (see
+        # set_max_turns()'s docstring for why dynamic budget state is
+        # deliberately in-memory-only) — a --resume simply won't carry this
+        # forward, same accepted tradeoff as the architect-derived budget.
+        self._last_hit_max_turns = False
+        # Optional scheduler for the parallel engineer fan-out: a semaphore
+        # SHARED by every agent in the team (created once in build_team()
+        # from LOOPER_MAX_PARALLEL_SESSIONS), bounding how many real
+        # claude_agent_sdk sessions run concurrently across the whole run.
+        # None (the default, and the CLI/web default when the env var is
+        # unset) means unbounded — FE/BE/OPS all run at once, as before.
+        # Bounding matters when an account-wide Claude Code session/usage
+        # limit is the scarce resource: three concurrent engineer sessions
+        # can trip it mid-fan-out, which is precisely the crash the
+        # checkpoint-resume machinery exists to recover from — a limiter
+        # avoids needing that recovery in the first place, trading wall
+        # -clock time for it. Skipped (zero-budget) roles never acquire a
+        # slot; GraphFlow's own dispatch order is untouched — waiting agents
+        # simply queue on the semaphore inside their turn.
+        self._session_limiter = session_limiter
+        # Extra env vars merged into this agent's real SDK session (on top
+        # of the full host environment claude_agent_sdk already inherits by
+        # default — confirmed by reading subprocess_cli.py's `connect()`:
+        # `{**os.environ, ...self._options.env}`). Currently used for one
+        # thing: QA's PLAYWRIGHT_BROWSERS_PATH (see build_team()), so the
+        # Chromium binary Playwright needs for visual verification is
+        # installed once into a location that persists across every run —
+        # not just implicitly relying on the host's own OS-level cache
+        # directory, which is fragile precisely where it matters most (a
+        # container restart in the Dockerized deployment has no such
+        # cache unless it's inside the already-mounted output/ volume).
+        self._extra_env = dict(extra_env) if extra_env is not None else {}
+        # Model routing: LOOPER_CODE_MODEL_<AGENT_NAME> (uppercased, e.g.
+        # LOOPER_CODE_MODEL_RELEASE_REPORTER=haiku) overrides the global
+        # LOOPER_CODE_MODEL for that one role. Defaults stay uniform on
+        # purpose: the reasoning turns are only ~7% of a real run's cost
+        # (measured), and the roles cheapest to downgrade (PM/architect)
+        # are the ones whose quality steers everything downstream —
+        # per-role downgrades are an operator experiment, not a default.
+        self._model = os.environ.get(
+            f"LOOPER_CODE_MODEL_{name.upper()}",
+            os.environ.get("LOOPER_CODE_MODEL", DEFAULT_MODEL),
+        )
         self._hooks = _make_hooks(cwd)
         self._context_sources = dict(context_sources) if context_sources is not None else None
         self._pointer_files = dict(pointer_files) if pointer_files is not None else None
@@ -230,21 +294,64 @@ class ClaudeCodeAgent(BaseChatAgent):
         """
         self._max_turns = max_turns
 
-    def find_message_from(self, source: str) -> BaseChatMessage | None:
-        """Most recent message from `source` in this agent's replayed
-        history, or None. `set_max_turns()` overrides aren't captured by
-        `save_state()`/`load_state()` (only `_history` is), so a freshly
-        -rebuilt agent on `--resume` reverts to the static default unless
-        the caller re-derives the dynamic budget itself — the architect's
-        own TECH DESIGN message is still in an engineer's history (every
-        engineer's `context_sources` includes `solution_architect`), so
-        re-parsing it from here reconstructs the same budget
-        deterministically. See `pipeline.py`'s resume handling in `main.py`.
+    @property
+    def max_turns(self) -> int:
+        """Current turn budget — the read counterpart to `set_max_turns()`,
+        for callers that need to compute a NEW budget relative to whatever
+        this agent's is right now (e.g. `pipeline.py`'s
+        `apply_visual_qa_budget()`, which adds an extra amount on top of
+        QA's current baseline) without reaching into `_max_turns` directly.
         """
-        for msg in reversed(self._history):
-            if msg.source == source:
-                return msg
-        return None
+        return self._max_turns
+
+    def _log_interaction(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str,
+        response: str | None,
+        cost_usd: float | None = None,
+        duration_ms: int | None = None,
+        error: str | None = None,
+        skipped: bool = False,
+        num_turns: int | None = None,
+    ) -> None:
+        """Append one JSON line recording this turn's real SDK exchange —
+        exactly what was sent as the prompt/system prompt and exactly what
+        came back (or the error, if the session never produced a response).
+        Best-effort: a logging failure (disk full, permissions) must never
+        take down an actual pipeline turn, so write errors are swallowed
+        the same way `_emit()` swallows on_event failures. No-op if no
+        `sdk_log_path` was configured (e.g. tests' ScriptedClaudeCodeAgent,
+        which never reaches this — it overrides on_messages() wholesale and
+        never calls the real SDK, so there's nothing to log).
+        """
+        if self._sdk_log_path is None:
+            return
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent": self.name,
+            "model": self._model,
+            "cwd": str(self._cwd),
+            "max_turns": self._max_turns,
+            "system_prompt": system_prompt,
+            "prompt": prompt,
+            "response": response,
+            "cost_usd": cost_usd,
+            "duration_ms": duration_ms,
+            # Actual tool-call turns the session used (ResultMessage.num_turns),
+            # vs. "max_turns" above (the budget) — the pair is what
+            # looper.report's budget-calibration table is computed from.
+            "num_turns": num_turns,
+            "error": error,
+            "skipped": skipped,
+        }
+        try:
+            self._sdk_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._sdk_log_path.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            pass
 
     async def _emit(self, event_type: str, detail: str = "", **extra: Any) -> None:
         if self._on_event is None:
@@ -347,7 +454,33 @@ class ClaudeCodeAgent(BaseChatAgent):
             )
             self._turn_in_progress = False
             await self._emit("turn_completed", final_text, cost_usd=0.0, duration_ms=0)
+            self._log_interaction(
+                prompt="(skipped — no tasks assigned, no session started)",
+                system_prompt=self._system_prompt,
+                response=final_text,
+                cost_usd=0.0,
+                duration_ms=0,
+                skipped=True,
+            )
             return Response(chat_message=TextMessage(content=final_text, source=self.name))
+
+        if self._last_hit_max_turns:
+            # This agent's previous real session ran out of turns before
+            # finishing (see the error_max_turns handling below) — most
+            # often the session right before a QA-rework turn, which is
+            # guaranteed to happen next for whichever engineer's defects
+            # caused the QA_FAIL. Handing it the identical budget that
+            # already proved too small (now with MORE work to do: fix the
+            # defects AND finish whatever the truncated first pass never
+            # got to) just reproduces the same failure. Bump by +50% (floor
+            # +8, so a small budget isn't bumped by a token amount), clamped
+            # to _MAX_TURN_BUDGET. One-shot: cleared immediately so a turn
+            # that finishes cleanly doesn't keep inflating the budget.
+            self._max_turns = min(_MAX_TURN_BUDGET, self._max_turns + max(8, self._max_turns // 2))
+            self._last_hit_max_turns = False
+            await self._emit(
+                "warning", f"{self.name} previously hit max_turns; raising budget to {self._max_turns}"
+            )
 
         prompt = self._build_prompt(new_sources={msg.source for msg in messages})
 
@@ -384,13 +517,20 @@ class ClaudeCodeAgent(BaseChatAgent):
             max_turns=self._max_turns,
             model=self._model,
             hooks=self._hooks,
+            env=self._extra_env,
         )
 
         transcript: list[str] = []
         result_text = ""
         cost_usd: float | None = None
         duration_ms: int | None = None
+        num_turns: int | None = None
         hit_max_turns = False
+        if self._session_limiter is not None:
+            # Team-wide cap on concurrent real SDK sessions (see __init__).
+            # Acquired only for the session itself — the skip path above and
+            # all prompt/bookkeeping work stay outside the critical section.
+            await self._session_limiter.acquire()
         try:
             async for msg in query(prompt=prompt, options=options):
                 if isinstance(msg, AssistantMessage):
@@ -410,10 +550,16 @@ class ClaudeCodeAgent(BaseChatAgent):
                         # QA; fail the whole run so --resume can retry this
                         # turn.
                         await self._emit("error", msg.result or str(msg.errors))
-                        raise RuntimeError(
-                            f"{self.name}: Claude Code session failed "
-                            f"({msg.subtype}): {msg.result or msg.errors}"
+                        error_text = f"({msg.subtype}): {msg.result or msg.errors}"
+                        self._log_interaction(
+                            prompt=prompt,
+                            system_prompt=system_prompt,
+                            response=None,
+                            cost_usd=msg.total_cost_usd,
+                            duration_ms=msg.duration_ms,
+                            error=error_text,
                         )
+                        raise RuntimeError(f"{self.name}: Claude Code session failed {error_text}")
                     if msg.is_error:
                         # error_max_turns: the role ran out of its turn
                         # budget before finishing, not a crash. Real
@@ -428,6 +574,7 @@ class ClaudeCodeAgent(BaseChatAgent):
                         # of the pipeline dying with nothing to resume into
                         # but the exact same turn budget.
                         hit_max_turns = True
+                        self._last_hit_max_turns = True
                         await self._emit(
                             "warning", f"{self.name} hit max_turns ({self._max_turns}) before finishing"
                         )
@@ -435,6 +582,7 @@ class ClaudeCodeAgent(BaseChatAgent):
                         result_text = msg.result or ""
                     cost_usd = msg.total_cost_usd
                     duration_ms = msg.duration_ms
+                    num_turns = msg.num_turns
         except RuntimeError:
             raise  # our own deliberate raise above for a genuine crash — propagate as-is
         except Exception as exc:
@@ -451,13 +599,51 @@ class ClaudeCodeAgent(BaseChatAgent):
             # Anything else really is an unhandled crash.
             if not hit_max_turns:
                 await self._emit("error", str(exc))
+                self._log_interaction(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    response=None,
+                    cost_usd=cost_usd,
+                    duration_ms=duration_ms,
+                    error=str(exc),
+                )
                 raise RuntimeError(f"{self.name}: Claude Code session failed: {exc}") from exc
+        finally:
+            if self._session_limiter is not None:
+                self._session_limiter.release()
 
         final_text = result_text or "\n".join(transcript) or "(no output produced)"
+        if hit_max_turns:
+            # A truncated turn's transcript is progress *narration*, not a
+            # completion report — observed live: a BE turn cut off at its
+            # limit left behind "Now tests: ... covering happy path,
+            # validation, idempotency" describing test files it never got
+            # to write. This text becomes the role's persisted artifact
+            # (.pipeline-docs/<role>.md) and is replayed to QA/downstream
+            # agents, so without this banner it actively claims completion
+            # of missing work. QA caught that case by checking disk, but
+            # only because it happened to; make the unreliability explicit
+            # instead of relying on downstream skepticism.
+            final_text = (
+                f"WARNING: this turn was cut off at its turn limit "
+                f"({self._max_turns} turns) before the role finished. The text below "
+                f"is the incomplete session's running narration, NOT a completion "
+                f"report — it may describe work that was planned but never done. "
+                f"Verify claims against the actual files on disk.\n\n{final_text}"
+            )
         final_text = self._apply_verdict_safety_net(final_text)
 
         self._turn_in_progress = False
         await self._emit("turn_completed", final_text, cost_usd=cost_usd, duration_ms=duration_ms)
+        self._log_interaction(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            response=final_text,
+            cost_usd=cost_usd,
+            duration_ms=duration_ms,
+            num_turns=num_turns,
+            error="hit max_turns before finishing" if hit_max_turns else None,
+        )
         return Response(chat_message=TextMessage(content=final_text, source=self.name))
 
     def _apply_verdict_safety_net(self, final_text: str) -> str:

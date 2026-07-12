@@ -24,12 +24,14 @@ from looper.pipeline import (
     build_team,
     parse_turn_budget,
     recover_stuck_agents,
+    reset_pending_activation_flags,
 )
 from looper.runner import AgentFailure, FailFastMonitor, run_team
 
 from .mock_agent import CRASH, ScriptedClaudeCodeAgent, set_script
 
 PM_TEXT = "# PRD\n## North Star Goal\nBuild a thing.\n"
+SCOPE_TEXT = "# SCOPE REVIEW\n## Verdict\nPROPORTIONATE\n## Must-Cut Items\n(none)\n"
 ARCHITECT_TEXT = "# TECH DESIGN\n## Task Breakdown\nT-1 [FE] thing\nT-2 [BE] thing\nT-3 [OPS] thing\n"
 FE_TEXT = "# FE IMPLEMENTATION\nDone.\n"
 BE_TEXT = "# BE IMPLEMENTATION\nDone.\n"
@@ -42,6 +44,7 @@ REPORTER_TEXT = "# FINAL DELIVERY REPORT\nDone.\n"
 
 BASE_SCRIPT = {
     "product_manager": [PM_TEXT],
+    "scope_validator": [SCOPE_TEXT],
     "solution_architect": [ARCHITECT_TEXT],
     "frontend_engineer": [FE_TEXT],
     "backend_engineer": [BE_TEXT],
@@ -164,7 +167,7 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
                     seen.append(message.source)
                     # Mirrors main.py: checkpoint after every completed turn.
                     checkpoint_state = await team1.save_state()
-        self.assertEqual(seen, ["user", "product_manager"])
+        self.assertEqual(seen, ["user", "product_manager", "scope_validator"])
         assert checkpoint_state is not None
 
         # "Fix" the crash for the retry — like a human re-running after a
@@ -301,6 +304,96 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("release_reporter", resumed)
 
 
+    async def test_checkpoint_resume_then_qa_fail_can_still_rework(self) -> None:
+        """Regression test for a real, reproduced bug, one layer deeper than
+        the crash-mid-fan-out test above: when ALL THREE parallel engineers
+        crash before any of them completes (not just one), the only
+        checkpoint that ends up on disk pre-dates GraphFlow's own
+        dispatch-time bookkeeping update for their shared "any" activation
+        groups (see reset_pending_activation_flags()'s docstring for the
+        full mechanism, traced against AutoGen's _digraph_group_chat.py).
+        recover_stuck_agents() finds nothing to recover here (matches the
+        live observation: turn_in_progress was False for all three, since
+        their crash happened before any checkpoint captured them mid-turn)
+        — GraphFlow correctly re-runs all three on resume regardless. The
+        bug is downstream: a LATER QA_FAIL, which shares the same
+        activation group as the architect's original fan-out edge, is
+        silently swallowed unless reset_pending_activation_flags() runs
+        first. This resumes the SAME crashed checkpoint twice — once
+        unpatched to prove the bug, once patched to prove the fix — exactly
+        mirroring test_checkpoint_resume_recovers_from_a_crash_mid_fan_out's
+        structure for the sibling bug it covers.
+        """
+        set_script(
+            {
+                **BASE_SCRIPT,
+                "frontend_engineer": [CRASH],
+                "backend_engineer": [CRASH],
+                "devops_engineer": [CRASH],
+            }
+        )
+        team1, _agents1 = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        seen: list[str] = []
+        checkpoint_state = None
+        with self.assertRaises(Exception):
+            # Mirrors main.py exactly: checkpoint only on each successfully
+            # -streamed message, never freshly after catching the crash —
+            # this is WHY the real checkpoint pre-dates the engineers'
+            # dispatch-time bookkeeping (none of them ever streams a
+            # message when all three crash), which is the whole bug.
+            async for message in team1.run_stream(task="Build a thing."):
+                if isinstance(message, BaseChatMessage):
+                    seen.append(message.source)
+                    checkpoint_state = await team1.save_state()
+        assert checkpoint_state is not None
+        self.assertEqual(seen, ["user", "product_manager", "scope_validator", "solution_architect"])
+
+        # Real observation this reproduces: nothing "stuck" by the
+        # turn_in_progress-based recovery — all three crashed before any
+        # checkpoint captured them mid-turn.
+        self.assertEqual(recover_stuck_agents(copy.deepcopy(checkpoint_state)), [])
+
+        fixed_script = {
+            **BASE_SCRIPT,
+            "frontend_engineer": [FE_TEXT, FE_TEXT],
+            "backend_engineer": [BE_TEXT, BE_TEXT],
+            "devops_engineer": [OPS_TEXT, OPS_TEXT],
+            "qa_engineer": [QA_FAIL_TEXT, QA_PASS_TEXT],
+            "uat_reviewer": [UAT_APPROVED_TEXT],
+        }
+
+        # Prove the bug: without reset_pending_activation_flags(), QA_FAIL
+        # never reaches a second engineer turn — the run falls straight out
+        # via GraphFlow's own "Digraph execution is complete" path.
+        unpatched_state = copy.deepcopy(checkpoint_state)
+        set_script(fixed_script)
+        team_unpatched, _a = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        await team_unpatched.load_state(unpatched_state)
+        buggy: list[str] = []
+        async for message in team_unpatched.run_stream(task=None):
+            if isinstance(message, BaseChatMessage):
+                buggy.append(message.source)
+        self.assertEqual(buggy.count("qa_engineer"), 1, "QA_FAIL happened once...")
+        self.assertEqual(buggy.count("frontend_engineer"), 1, "...but never triggered a rework turn (the bug)")
+        self.assertNotIn("uat_reviewer", buggy)
+
+        # Now prove the fix.
+        patched_state = copy.deepcopy(checkpoint_state)
+        reset = reset_pending_activation_flags(patched_state)
+        self.assertEqual(len(reset), 3)
+        set_script(fixed_script)
+        team_patched, _a = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        await team_patched.load_state(patched_state)
+        fixed: list[str] = []
+        async for message in team_patched.run_stream(task=None):
+            if isinstance(message, BaseChatMessage):
+                fixed.append(message.source)
+        self.assertEqual(fixed.count("frontend_engineer"), 2, "rework turn now fires correctly")
+        self.assertEqual(fixed.count("qa_engineer"), 2)
+        self.assertIn("uat_reviewer", fixed)
+        self.assertIn("release_reporter", fixed)
+
+
 class RecoverStuckAgentsTests(unittest.TestCase):
     """Pure dict-manipulation unit tests for recover_stuck_agents(), no
     GraphFlow/asyncio involved — see the docstring on the function itself
@@ -342,6 +435,82 @@ class RecoverStuckAgentsTests(unittest.TestCase):
     def test_missing_graph_manager_is_a_no_op(self) -> None:
         state = {"agent_states": {"devops_engineer": {"agent_state": {"turn_in_progress": True}}}}
         self.assertEqual(recover_stuck_agents(state), [])
+
+
+class ResetPendingActivationFlagsTests(unittest.TestCase):
+    """Pure dict-manipulation unit tests for reset_pending_activation_flags()
+    — see its docstring and PipelineOrchestrationTests
+    .test_checkpoint_resume_then_qa_fail_can_still_rework for the full
+    end-to-end regression coverage of the real bug this fixes: a QA_FAIL
+    rework edge silently never firing after a crash-mid-fan-out resume,
+    because the "any"-activation group's enqueued flag was still True from
+    the original (never-popped) dispatch."""
+
+    def test_resets_true_flags_for_nodes_in_ready(self) -> None:
+        state = {
+            "agent_states": {
+                "GraphManager": {
+                    "ready": ["frontend_engineer", "backend_engineer"],
+                    "enqueued_any": {
+                        "frontend_engineer": {"frontend_engineer_activation": True},
+                        "backend_engineer": {"backend_engineer_activation": True},
+                        "devops_engineer": {"devops_engineer_activation": True},
+                    },
+                }
+            }
+        }
+        reset = reset_pending_activation_flags(state)
+        self.assertEqual(sorted(reset), ["backend_engineer/backend_engineer_activation", "frontend_engineer/frontend_engineer_activation"])
+        gm = state["agent_states"]["GraphManager"]
+        self.assertFalse(gm["enqueued_any"]["frontend_engineer"]["frontend_engineer_activation"])
+        self.assertFalse(gm["enqueued_any"]["backend_engineer"]["backend_engineer_activation"])
+        # devops_engineer isn't in ready — must be left untouched.
+        self.assertTrue(gm["enqueued_any"]["devops_engineer"]["devops_engineer_activation"])
+
+    def test_already_false_flags_are_a_no_op(self) -> None:
+        state = {
+            "agent_states": {
+                "GraphManager": {
+                    "ready": ["frontend_engineer"],
+                    "enqueued_any": {"frontend_engineer": {"frontend_engineer_activation": False}},
+                }
+            }
+        }
+        self.assertEqual(reset_pending_activation_flags(state), [])
+
+    def test_missing_graph_manager_is_a_no_op(self) -> None:
+        self.assertEqual(reset_pending_activation_flags({"agent_states": {}}), [])
+
+    def test_reproduces_the_real_crash_mid_fanout_checkpoint(self) -> None:
+        """The exact shape observed live: the architect's fan-out dispatched
+        all three engineers (added to ready, enqueued_any=True), then all
+        three crashed before any completed — so recover_stuck_agents()
+        (turn_in_progress-based) finds nothing, but the QA_FAIL edge that
+        fires much later would still be silently swallowed without this
+        fix."""
+        state = {
+            "agent_states": {
+                "GraphManager": {
+                    "ready": ["frontend_engineer", "backend_engineer", "devops_engineer"],
+                    "enqueued_any": {
+                        "frontend_engineer": {"frontend_engineer_activation": True},
+                        "backend_engineer": {"backend_engineer_activation": True},
+                        "devops_engineer": {"devops_engineer_activation": True},
+                        "qa_engineer": {"qa_engineer": False},
+                    },
+                },
+                "frontend_engineer": {"agent_state": {"turn_in_progress": False}},
+                "backend_engineer": {"agent_state": {"turn_in_progress": False}},
+                "devops_engineer": {"agent_state": {"turn_in_progress": False}},
+            }
+        }
+        self.assertEqual(recover_stuck_agents(state), [], "matches the live observation: nothing 'stuck'")
+        reset = reset_pending_activation_flags(state)
+        self.assertEqual(len(reset), 3)
+        gm = state["agent_states"]["GraphManager"]
+        for node in ("frontend_engineer", "backend_engineer", "devops_engineer"):
+            group = f"{node}_activation"
+            self.assertFalse(gm["enqueued_any"][node][group], f"{node}'s group must be re-armed for QA_FAIL")
 
 
 if __name__ == "__main__":
