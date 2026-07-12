@@ -233,6 +233,21 @@ class Defect:
     id: str  # "D-1"
     severity: str  # "BLOCKER" | "MAJOR" | "MINOR"
     owners: tuple[str, ...]  # subset of ("FE", "BE", "OPS"); may be empty
+    # Cleaned remainder of the defining line — a short human-readable gist,
+    # not the full evidence. Feeds run_memory's cross-run defect hints
+    # ("[BLOCKER] backend build fails under noUnusedParameters..."); ""
+    # when the line had nothing after the severity/owner tags.
+    summary: str = ""
+
+
+def _clean_defect_summary(rest: str) -> str:
+    """Strip markdown/table decoration from a defect line's tail so it
+    reads as prose in a prompt hint. Truncated — hints are reminders, the
+    full report lives in the run's own artifacts."""
+    cleaned = _OWNER_TAG.sub("", rest)
+    cleaned = re.sub(r"[*_`|]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" —–-:;,. ")
+    return cleaned[:160]
 
 
 def parse_defects(text: str) -> list[Defect]:
@@ -247,7 +262,12 @@ def parse_defects(text: str) -> list[Defect]:
         if defect_id in seen:
             continue
         owners = tuple(dict.fromkeys(_OWNER_TAG.findall(rest)))
-        seen[defect_id] = Defect(id=defect_id, severity=severity, owners=owners)
+        seen[defect_id] = Defect(
+            id=defect_id,
+            severity=severity,
+            owners=owners,
+            summary=_clean_defect_summary(rest),
+        )
     return list(seen.values())
 
 

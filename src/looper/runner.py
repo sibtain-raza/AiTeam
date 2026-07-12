@@ -56,16 +56,61 @@ class FailFastMonitor:
     """Wraps a caller-supplied `on_event` so a crash is detected from the
     agent's *own* error report, independent of whether GraphFlow itself
     notices. Pass `.on_event` to `build_team()`; pass the monitor itself
-    to `run_team()`."""
+    to `run_team()`.
 
-    def __init__(self, inner: OnEvent | None = None) -> None:
+    Also the run-level budget governor: every `turn_completed` event
+    carries that turn's real `cost_usd`, so this is the one place that
+    sees the whole run's spend as it happens. When `max_run_budget_usd`
+    is set and cumulative spend crosses it, the run is stopped through
+    the exact same kill switch a crashed agent uses — checkpointed,
+    resumable, with a clear reason — rather than a new mechanism.
+    Deliberately checked AFTER a turn completes, not before it starts:
+    a turn already in flight has already spent its money, and its output
+    is on disk either way; the cap prevents the NEXT session, which is
+    the only spend still preventable. `seed_spent()` lets a resumed run
+    start the counter from what the interrupted run already spent
+    (main.py derives it from the workspace's SDK log) instead of zero.
+    """
+
+    def __init__(self, inner: OnEvent | None = None, max_run_budget_usd: float | None = None) -> None:
         self._inner = inner
         self._abort = asyncio.Event()
         self.failure: AgentFailure | None = None
+        self._max_run_budget_usd = max_run_budget_usd
+        self.spent_usd = 0.0
+
+    def seed_spent(self, amount_usd: float) -> None:
+        """Start the cumulative counter from a prior partial run's spend
+        (resume path) so the run-level cap covers the whole run, not just
+        the portion after the latest resume."""
+        self.spent_usd = amount_usd
+
+    def reset(self) -> None:
+        """Re-arm after a handled failure so the same monitor can watch
+        the auto-resumed continuation (main.py's recovery loop). Clears
+        the kill switch and the recorded failure; deliberately does NOT
+        clear `spent_usd` — the run-level budget is cumulative across
+        resumes (seed_spent() re-derives it authoritatively anyway)."""
+        self.failure = None
+        self._abort = asyncio.Event()
 
     async def on_event(self, source: str, event_type: str, detail: str, extra: dict) -> None:
         if self._inner is not None:
             await self._inner(source, event_type, detail, extra)
+        if event_type == "turn_completed":
+            self.spent_usd += extra.get("cost_usd") or 0.0
+            if (
+                self._max_run_budget_usd is not None
+                and self.spent_usd > self._max_run_budget_usd
+                and not self._abort.is_set()
+            ):
+                self.failure = AgentFailure(
+                    "run_budget_governor",
+                    f"run budget exceeded: ${self.spent_usd:.2f} spent > "
+                    f"${self._max_run_budget_usd:.2f} cap (LOOPER_MAX_RUN_BUDGET_USD) — "
+                    f"run stopped after the completed turn; checkpoint is resumable",
+                )
+                self._abort.set()
         if event_type == "error" and not self._abort.is_set():
             self.failure = AgentFailure(source, detail)
             self._abort.set()

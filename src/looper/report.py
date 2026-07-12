@@ -22,30 +22,13 @@ and exits. It never writes anything.
 """
 
 import argparse
-import json
 from pathlib import Path
 
 from .artifacts import parse_defects
-from .pipeline import ARTIFACT_DIR_NAME, SDK_LOG_FILE_NAME
-from .run_memory import load_runs
+from .run_memory import load_runs, load_sdk_entries
 
 _ENGINEER_AGENTS = ("frontend_engineer", "backend_engineer", "devops_engineer")
 _MAX_TURNS_ERROR = "hit max_turns before finishing"
-
-
-def _load_sdk_entries(workspace: Path) -> list[dict]:
-    log_file = workspace / ARTIFACT_DIR_NAME / SDK_LOG_FILE_NAME
-    if not log_file.exists():
-        return []
-    entries = []
-    for line in log_file.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return entries
 
 
 def build_report(output_dir: Path, window: int = 20) -> dict:
@@ -86,7 +69,7 @@ def build_report(output_dir: Path, window: int = 20) -> dict:
         if not workspace:
             continue
         seen_defect_ids: set[str] = set()
-        for entry in _load_sdk_entries(Path(workspace)):
+        for entry in load_sdk_entries(Path(workspace)):
             agent = entry.get("agent")
             if (
                 agent in _ENGINEER_AGENTS

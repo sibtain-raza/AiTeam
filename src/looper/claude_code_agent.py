@@ -210,6 +210,7 @@ class ClaudeCodeAgent(BaseChatAgent):
         sdk_log_path: Path | None = None,
         session_limiter: "asyncio.Semaphore | None" = None,
         extra_env: Mapping[str, str] | None = None,
+        max_budget_usd: float | None = None,
     ) -> None:
         super().__init__(name, description=description)
         self._system_prompt = system_prompt
@@ -266,6 +267,15 @@ class ClaudeCodeAgent(BaseChatAgent):
         # container restart in the Dockerized deployment has no such
         # cache unless it's inside the already-mounted output/ volume).
         self._extra_env = dict(extra_env) if extra_env is not None else {}
+        # Optional hard dollar ceiling for each real SDK session, passed
+        # straight through to ClaudeAgentOptions.max_budget_usd (the SDK
+        # stops the query with an `error_max_budget_usd` result when
+        # exceeded — handled below like error_max_turns: partial output +
+        # warning banner, never a run-killing crash). None = uncapped, the
+        # historical behavior. Set via LOOPER_MAX_SESSION_BUDGET_USD in
+        # build_team(); complements the RUN-level ceiling enforced by
+        # runner.FailFastMonitor, which sums completed turns across agents.
+        self._max_budget_usd = max_budget_usd
         # Model routing: LOOPER_CODE_MODEL_<AGENT_NAME> (uppercased, e.g.
         # LOOPER_CODE_MODEL_RELEASE_REPORTER=haiku) overrides the global
         # LOOPER_CODE_MODEL for that one role. Defaults stay uniform on
@@ -518,6 +528,7 @@ class ClaudeCodeAgent(BaseChatAgent):
             model=self._model,
             hooks=self._hooks,
             env=self._extra_env,
+            max_budget_usd=self._max_budget_usd,
         )
 
         transcript: list[str] = []
@@ -526,6 +537,7 @@ class ClaudeCodeAgent(BaseChatAgent):
         duration_ms: int | None = None
         num_turns: int | None = None
         hit_max_turns = False
+        hit_budget_cap = False
         if self._session_limiter is not None:
             # Team-wide cap on concurrent real SDK sessions (see __init__).
             # Acquired only for the session itself — the skip path above and
@@ -544,7 +556,7 @@ class ClaudeCodeAgent(BaseChatAgent):
                                 tool_name=block.name,
                             )
                 elif isinstance(msg, ResultMessage):
-                    if msg.is_error and msg.subtype != "error_max_turns":
+                    if msg.is_error and msg.subtype not in ("error_max_turns", "error_max_budget_usd"):
                         # A genuine crash (auth/billing/session-limit/etc.) —
                         # no usable output exists, so there's nothing to hand
                         # QA; fail the whole run so --resume can retry this
@@ -573,11 +585,28 @@ class ClaudeCodeAgent(BaseChatAgent):
                         # files — can fail it with a concrete defect instead
                         # of the pipeline dying with nothing to resume into
                         # but the exact same turn budget.
-                        hit_max_turns = True
-                        self._last_hit_max_turns = True
-                        await self._emit(
-                            "warning", f"{self.name} hit max_turns ({self._max_turns}) before finishing"
-                        )
+                        #
+                        # error_max_budget_usd (the per-session dollar cap,
+                        # see __init__'s max_budget_usd) gets the identical
+                        # treatment for the identical reason — the work
+                        # already on disk is real; only the conversation was
+                        # cut off. The one difference: it does NOT set
+                        # _last_hit_max_turns, since bumping the TURN budget
+                        # can't help a session whose constraint is dollars.
+                        if msg.subtype == "error_max_turns":
+                            hit_max_turns = True
+                            self._last_hit_max_turns = True
+                            await self._emit(
+                                "warning",
+                                f"{self.name} hit max_turns ({self._max_turns}) before finishing",
+                            )
+                        else:
+                            hit_budget_cap = True
+                            await self._emit(
+                                "warning",
+                                f"{self.name} hit its session budget cap "
+                                f"(${self._max_budget_usd}) before finishing",
+                            )
                     else:
                         result_text = msg.result or ""
                     cost_usd = msg.total_cost_usd
@@ -596,8 +625,13 @@ class ClaudeCodeAgent(BaseChatAgent):
             # saw error_max_turns, this second exception carries no new
             # information (same "reached maximum number of turns" text) —
             # swallow it and fall through to the partial-output path below.
+            # error_max_budget_usd is gated the same way on the assumption
+            # the CLI exits non-zero symmetrically for it (same "for
+            # shell-script consumers" mechanism); NOT yet live-verified for
+            # the budget case — if a budget-capped session ever crashes the
+            # run here anyway, that assumption is what to re-check.
             # Anything else really is an unhandled crash.
-            if not hit_max_turns:
+            if not (hit_max_turns or hit_budget_cap):
                 await self._emit("error", str(exc))
                 self._log_interaction(
                     prompt=prompt,
@@ -613,7 +647,7 @@ class ClaudeCodeAgent(BaseChatAgent):
                 self._session_limiter.release()
 
         final_text = result_text or "\n".join(transcript) or "(no output produced)"
-        if hit_max_turns:
+        if hit_max_turns or hit_budget_cap:
             # A truncated turn's transcript is progress *narration*, not a
             # completion report — observed live: a BE turn cut off at its
             # limit left behind "Now tests: ... covering happy path,
@@ -624,9 +658,14 @@ class ClaudeCodeAgent(BaseChatAgent):
             # of missing work. QA caught that case by checking disk, but
             # only because it happened to; make the unreliability explicit
             # instead of relying on downstream skepticism.
+            cutoff = (
+                f"its turn limit ({self._max_turns} turns)"
+                if hit_max_turns
+                else f"its session budget cap (${self._max_budget_usd})"
+            )
             final_text = (
-                f"WARNING: this turn was cut off at its turn limit "
-                f"({self._max_turns} turns) before the role finished. The text below "
+                f"WARNING: this turn was cut off at {cutoff} "
+                f"before the role finished. The text below "
                 f"is the incomplete session's running narration, NOT a completion "
                 f"report — it may describe work that was planned but never done. "
                 f"Verify claims against the actual files on disk.\n\n{final_text}"
@@ -642,7 +681,13 @@ class ClaudeCodeAgent(BaseChatAgent):
             cost_usd=cost_usd,
             duration_ms=duration_ms,
             num_turns=num_turns,
-            error="hit max_turns before finishing" if hit_max_turns else None,
+            error=(
+                "hit max_turns before finishing"
+                if hit_max_turns
+                else "hit max_budget_usd before finishing"
+                if hit_budget_cap
+                else None
+            ),
         )
         return Response(chat_message=TextMessage(content=final_text, source=self.name))
 

@@ -25,8 +25,10 @@ USER GOAL
    ▼
 [QA Engineer] ── tests vs acceptance criteria
    │
-   ├── QA_FAIL (defects tagged FE/BE/OPS) ──► back to owning engineer(s)  [max 3 loops]
+   ├── QA_FAIL #1-#2 (defects tagged FE/BE/OPS) ──► back to owning engineer(s)
    │
+   ├── QA_FAIL #3 (rework budget exhausted) ──► [PM: UAT] final shippability judgment
+   │                                            (approve with Known Issues, or reject)
    └── QA_PASS
           │
           ▼
@@ -138,9 +140,10 @@ PROCESS:
    - Reliability: timeouts and retry policy for every network call, idempotency where the PRD implies retries or payments, graceful shutdown
    - Observability: structured logging with request correlation, health and readiness endpoints, and which NFR-n each mechanism verifies
 5. Break work into tasks. Tag every task [FE], [BE], or [OPS]. Each task lists: id, description, contract(s) it implements, and which acceptance criteria (AC-n) and NFRs (NFR-n) it satisfies. Every AC-n AND NFR-n from the PRD MUST map to at least one task — if an NFR maps to no task, redesign until it does. It is correct and expected for a role to have ZERO tagged tasks when the goal has no work for it — say so explicitly (e.g. "No [BE] tasks — this goal has no server-side logic") rather than inventing a task to fill the section.
-6. Call out risks (top 3–5) and the mitigation baked into the design for each.
+6. Call out risks (top 3-5) and the mitigation baked into the design for each.
 7. Estimate a turn budget for each of FE/BE/OPS: how many tool-call turns (each Read/Write/Edit/Bash invocation is one turn) that engineer will realistically need to complete their tagged tasks end to end, including writing tests and self-verifying. Budget generously enough to actually finish — an engineer that runs out of turns mid-task produces incomplete, unverified work, which costs far more (a QA_FAIL rework loop) than a few extra turns would have. Rough guide: a handful of files with little real logic ≈ 10-15 turns; multiple files with moderate logic (auth, several endpoints, a non-trivial UI, DB migrations) ≈ 20-35; many files or unusually complex logic ≈ 35-50. A role with ZERO tagged tasks (step 5) MUST get a turn budget of exactly 0 — this is what tells the pipeline to skip that engineer's session entirely instead of running one for nothing. Never give a placeholder budget to a role with no real work.
 8. Decide whether this goal's frontend has enough custom visual/interaction design (bespoke animation, scroll-driven effects, hover/motion micro-interactions, a stated "premium/cinematic/polished feel" requirement) that a text-only code review cannot adequately verify it — most goals do NOT meet this bar; a standard form, dashboard, or CRUD UI does not need it. If it does, state `VISUAL_QA: YES: <N> — <one-line reason>` where N is the EXTRA tool-call turns QA needs on top of its normal budget to build the app, run it, and capture screenshots/short recordings via Playwright. Otherwise state `VISUAL_QA: NO — <one-line reason>`. This line is a real budget decision, not decoration — QA cannot render anything without turns you actually grant it. Budget generously, same reasoning as the engineer estimates above: Rough guide — a single page/component ≈ 10-15 extra turns; a small multi-page app (a handful of routes, three breakpoints, one interaction recording) ≈ 25-40 extra turns (confirmed by a real run: 15 left QA stuck mid-setup with no screenshots taken; 35 completed the full pass with margin to spare); a larger or more heavily animated site ≈ 40-50+. Running out of turns mid-capture wastes the whole pass, same as it does for an engineer.
+9. Separately, decide whether the design has a real deployment surface worth verifying end to end: containerization (Dockerfile/compose) plus the health/readiness endpoints your Cross-Cutting Design specifies. If it does, state `DEPLOY_VERIFY: YES: <N> — <one-line reason>` where N is the EXTRA tool-call turns QA needs to build the shipped images, start the stack, hit the health endpoints and one real request path against the running containers, and tear it all down. Rough guide: 10-20 extra turns — image builds are slow, lean higher with multiple Dockerfiles. Otherwise state `DEPLOY_VERIFY: NO — <one-line reason>` (e.g. zero [OPS] tasks, nothing containerized). Docker may not exist on the host QA runs on — QA checks availability first and reports the step as skipped-for-environment rather than failing, so a YES is safe to give whenever the design itself warrants it.
 
 OUTPUT ARTIFACT:
 # TECH DESIGN
@@ -151,6 +154,7 @@ OUTPUT ARTIFACT:
 ## Task Breakdown          (T-1 [BE] ..., T-2 [FE] ..., each with "Satisfies: AC-n, NFR-n")
 ## Turn Budget Estimate    (exactly one line per role, format "FE: <N> — <one-line reason>", same for BE and OPS)
 ## Visual QA               (exactly one line: "VISUAL_QA: YES: <N> — <reason>" or "VISUAL_QA: NO — <reason>")
+## Deploy Verification     (exactly one line: "DEPLOY_VERIFY: YES: <N> — <reason>" or "DEPLOY_VERIFY: NO — <reason>")
 ## Risks
 ## Assumptions
 ```
@@ -214,6 +218,7 @@ RULES:
 - Containers are production-shaped: multi-stage builds, non-root user, pinned base-image versions (no :latest), .dockerignore, HEALTHCHECK wired to the design's health endpoint, logs to stdout/stderr, restart policy and resource limits in compose/IaC.
 - CI runs lint, tests, and image build as separate failing steps; a dependency/image vulnerability scan step is included.
 - Secrets are never baked into images or committed: define all env vars from the TECH DESIGN's config table with safe defaults or clear placeholders, and ship a .env.example.
+- Verify your own deliverables actually build before finishing: if the Docker daemon is available (`docker info` succeeds), run the image build(s) you shipped (`docker compose build` or the individual `docker build`s) and fix what fails — a Dockerfile that has never been built is not a deliverable. If the daemon is unavailable in this environment, state that explicitly under Assumptions instead of implying the build was verified.
 - The RUNBOOK must also cover: how to verify the service is healthy after start, how to read the logs, and how to roll back to the previous image.
 - On a REWORK loop: fix ONLY [OPS] defects, referencing defect ids. Re-emit every file you changed, complete.
 
@@ -247,9 +252,15 @@ PROCESS:
    c. Read each screenshot directly (they are images) and check for: broken or overlapping layout, missing/broken images, illegible or clipped text, obviously wrong spacing or alignment, and unstyled or unfinished-looking sections. Log any genuine rendering defect found this way as a normal defect (D-n, tag [FE], evidence = screenshot file path + what's wrong).
    d. State this check's real limit in your report, do not overclaim it: a screenshot is a frozen frame and a short recording is a coarse signal. This step verifies rendering correctness and that an interaction visibly animates — it does NOT and CANNOT verify subjective animation "feel," smoothness, or polish. Never claim this step confirms production-grade animation quality.
    e. Stop the preview server when done. If `VISUAL_QA: NO` (or the line is absent), skip this step entirely and rely on the checks in step 2.
-5. On a REWORK loop: first re-verify every previously reported defect and mark it FIXED or NOT FIXED (a NOT FIXED defect keeps its id and severity); then regression-check the changed files for new breakage. Continue D-n numbering — never reuse ids.
-6. SEVERITY GUIDE: BLOCKER = system cannot run or a security hole (missing auth, injection, committed secret). MAJOR = an AC/NFR in the Definition of Done fails. MINOR = everything else.
-7. VERDICT RULE: any BLOCKER or MAJOR defect ⇒ FAIL. Only MINOR defects ⇒ PASS with notes.
+5. If the TECH DESIGN's Deploy Verification line says `DEPLOY_VERIFY: YES`, verify the shipped deployment path end to end — reading a Dockerfile is not evidence it builds:
+   a. Check Docker availability first (`docker info`). If the daemon is unavailable, record this step as SKIPPED (environment) in your report with the exact error — an unavailable daemon is an environment limitation, NOT a defect and NOT a reason to fail the run.
+   b. Build the shipped images (`docker compose build`, or the individual `docker build`s the RUNBOOK documents). A build failure is a defect — usually BLOCKER, since the artifact cannot be deployed at all.
+   c. Start the stack (`docker compose up -d`), wait for readiness, then hit the design's health/readiness endpoints AND at least one real request path (a list endpoint, a form submission) against the RUNNING containers — not a dev server. Failures are defects; cite the container logs as evidence.
+   d. Tear everything down when finished (`docker compose down -v`), including on failure — never leave containers running.
+   If `DEPLOY_VERIFY: NO` (or the line is absent), skip this step entirely.
+6. On a REWORK loop: first re-verify every previously reported defect and mark it FIXED or NOT FIXED (a NOT FIXED defect keeps its id and severity); then regression-check the changed files for new breakage. Continue D-n numbering — never reuse ids.
+7. SEVERITY GUIDE: BLOCKER = system cannot run or a security hole (missing auth, injection, committed secret). MAJOR = an AC/NFR in the Definition of Done fails. MINOR = everything else.
+8. VERDICT RULE: any BLOCKER or MAJOR defect ⇒ FAIL. Only MINOR defects ⇒ PASS with notes.
 
 OUTPUT ARTIFACT:
 # QA REPORT
@@ -271,7 +282,8 @@ ROLE: The same Product Manager, now performing User Acceptance Testing. Inputs: 
 PROCESS:
 1. Ignore implementation details. Ask only: does this deliver the North Star Goal for the persona? Walk through each user story as the user would experience it — including what they experience when something fails (errors, empty states), since production users hit those paths.
 2. Check nothing from Out of Scope leaked in, and nothing from Definition of Done was silently dropped. Items under the SCOPE REVIEW's Must-Cut list were deliberately descoped before design — their absence is not a silently-dropped DoD item; but if a Must-Cut item was in fact essential to the original goal, that is grounds for rejection with corrected scope notes (the trim was wrong), not a defect against the engineers. Spot-check that accepted MINOR defects and documented assumptions don't add up to something a real user would consider broken.
-3. If the implementation satisfies the PRD but the PRD misread the original goal, that is YOUR grooming failure — reject with corrected scope notes so the re-groomed PRD fixes it.
+3. If the QA REPORT you received ends in QA_FAIL, the rework budget is exhausted and you are the final gate — judge shippability, not process. If every remaining defect is acceptable as a documented known issue against the ORIGINAL goal (MINOR items, or a MAJOR touching a non-essential flow), APPROVE and list every open defect prominently in your Final Summary under a "Known Issues" heading — never hide or soften them. If any remaining defect makes the product unfit for the goal's core purpose, REJECT with corrected scope notes (this triggers the one re-scope loop). An open BLOCKER is never approvable.
+4. If the implementation satisfies the PRD but the PRD misread the original goal, that is YOUR grooming failure — reject with corrected scope notes so the re-groomed PRD fixes it.
 
 OUTPUT ARTIFACT:
 # UAT REPORT

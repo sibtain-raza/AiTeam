@@ -54,19 +54,23 @@ SDK_LOG_FILE_NAME = "sdk-interactions.jsonl"
 MIN_ENGINEER_TURNS = 8
 MAX_ENGINEER_TURNS = 50
 
-# Ceiling for the EXTRA turns a Visual QA pass (see ARCHITECT_PROMPT's
-# "Visual QA" section / apply_visual_qa_budget() below) can add to QA's
-# baseline QA_MAX_TURNS. QA's own render-and-screenshot workflow (build,
-# start a preview server, install/run Playwright, capture + Read several
-# images) is bounded work even for a highly animated frontend — this caps
-# a miscalibrated architect estimate the same way MAX_ENGINEER_TURNS caps
-# the per-engineer estimate above.
+# Ceilings for the EXTRA turns the architect's QA gates (see
+# ARCHITECT_PROMPT's "Visual QA" and "Deploy Verification" sections /
+# apply_visual_qa_budget() and apply_deploy_verify_budget() below) can add
+# to QA's baseline QA_MAX_TURNS. Both workflows are bounded even at their
+# heaviest (Visual QA: build + preview server + Playwright captures;
+# deploy verify: image builds + compose up + health/request checks +
+# teardown) — the caps limit a miscalibrated architect estimate the same
+# way MAX_ENGINEER_TURNS caps the per-engineer estimate above. A run where
+# the architect grants both gates gets both extras, cumulatively.
 MAX_VISUAL_QA_EXTRA_TURNS = 30
+MAX_DEPLOY_VERIFY_EXTRA_TURNS = 25
 
 _TURN_BUDGET_LINE = re.compile(r"^\s*(FE|BE|OPS)\s*:\s*(\d+)", re.MULTILINE)
 _TURN_BUDGET_ROLE_TO_AGENT = {"FE": "frontend_engineer", "BE": "backend_engineer", "OPS": "devops_engineer"}
 
 _VISUAL_QA_LINE = re.compile(r"VISUAL_QA\s*:\s*(YES|NO)\s*(?::\s*(\d+))?", re.IGNORECASE)
+_DEPLOY_VERIFY_LINE = re.compile(r"DEPLOY_VERIFY\s*:\s*(YES|NO)\s*(?::\s*(\d+))?", re.IGNORECASE)
 
 
 def parse_turn_budget(text: str) -> dict[str, int]:
@@ -128,6 +132,43 @@ def apply_visual_qa_budget(
     if message.source != "solution_architect":
         return 0
     extra = parse_visual_qa_extra_turns(message.to_text())
+    if extra == 0:
+        return 0
+    qa = agents.get("qa_engineer")
+    if qa is None:
+        return 0
+    qa.set_max_turns(base_turns + extra)
+    return extra
+
+
+def parse_deploy_verify_extra_turns(text: str) -> int:
+    """Extract the architect's "## Deploy Verification" verdict from its
+    TECH DESIGN (format: a single `DEPLOY_VERIFY: YES: <N> — <reason>` or
+    `DEPLOY_VERIFY: NO — <reason>` line). Same contract as
+    `parse_visual_qa_extra_turns()`: 0 for `NO`, a missing section, or a
+    `YES` with no parseable number; clamped to
+    `[0, MAX_DEPLOY_VERIFY_EXTRA_TURNS]`.
+    """
+    match = _DEPLOY_VERIFY_LINE.search(text)
+    if match is None or match.group(1).upper() != "YES" or match.group(2) is None:
+        return 0
+    return max(0, min(MAX_DEPLOY_VERIFY_EXTRA_TURNS, int(match.group(2))))
+
+
+def apply_deploy_verify_budget(
+    message: BaseChatMessage, agents: Mapping[str, ClaudeCodeAgent], base_turns: int
+) -> int:
+    """Deploy-verification counterpart to `apply_visual_qa_budget()` (see
+    its docstring — identical contract, different gate line): grants QA the
+    extra turns to build the shipped images, run the compose stack, hit
+    the health endpoints and a real request path, and tear it down. Called
+    AFTER apply_visual_qa_budget() at every call site with QA's
+    then-current budget as `base_turns`, so a design that grants both
+    gates stacks both extras.
+    """
+    if message.source != "solution_architect":
+        return 0
+    extra = parse_deploy_verify_extra_turns(message.to_text())
     if extra == 0:
         return 0
     qa = agents.get("qa_engineer")
@@ -202,11 +243,12 @@ def reapply_turn_budget_on_resume(
     the file doesn't exist (the architect hasn't completed a turn on this
     checkpoint) or has no parseable budget section.
 
-    Also re-applies QA's Visual QA extra-turns budget (`apply_visual_qa_
-    budget()`) from the same on-disk design, for the identical reason —
-    that override is pure in-memory state too. Included in the returned
-    dict under the `"QA_VISUAL"` key when non-zero, alongside the FE/BE/OPS
-    keys, so callers can log everything re-applied in one line.
+    Also re-applies QA's Visual QA and Deploy Verification extra-turns
+    budgets (`apply_visual_qa_budget()` / `apply_deploy_verify_budget()`)
+    from the same on-disk design, for the identical reason — those
+    overrides are pure in-memory state too. Included in the returned dict
+    under `"QA_VISUAL"` / `"QA_DEPLOY"` keys when non-zero, alongside the
+    FE/BE/OPS keys, so callers can log everything re-applied in one line.
     """
     design_path = workspace / ARTIFACT_DIR_NAME / "solution_architect.md"
     if not design_path.exists():
@@ -218,6 +260,9 @@ def reapply_turn_budget_on_resume(
         visual_extra = apply_visual_qa_budget(message, agents, qa.max_turns)
         if visual_extra:
             budget["QA_VISUAL"] = visual_extra
+        deploy_extra = apply_deploy_verify_budget(message, agents, qa.max_turns)
+        if deploy_extra:
+            budget["QA_DEPLOY"] = deploy_extra
     return budget
 
 
@@ -353,12 +398,76 @@ def verdict_is(token: str):
     return check
 
 
+class QaVerdictRouter:
+    """Stateful edge conditions for QA's outgoing edges: graceful
+    degradation instead of a hard kill when the rework budget runs out.
+
+    Before this, the 3rd QA_FAIL tripped TokenCountTermination and the run
+    died with PIPELINE_FAILED — all the work on disk, no verdict, no
+    report. A real team at that point doesn't burn the building down; it
+    judges shippability. Now: QA_FAIL #1 and #2 route to the engineers for
+    rework exactly as before, and QA_FAIL #`max_fails` routes to UAT
+    instead, whose prompt (see UAT_PROMPT's rework-exhausted rule) makes
+    the final call — approve with the open defects documented prominently
+    as Known Issues, or reject into the one re-scope loop. A BLOCKER is
+    never approvable.
+
+    Mechanics: both edge conditions may be called for the same QA message
+    (GraphFlow evaluates every outgoing edge's condition against it), so
+    the fail counter registers each distinct message object exactly once —
+    `id()` is stable here because messages are retained in GraphFlow's own
+    message thread for the run's lifetime.
+
+    Two documented limits, both bounded by the safety terminations in
+    build_team():
+    - The count is cumulative across the whole run, including after a UAT
+      re-scope: a re-scoped attempt that fails QA again goes straight to
+      final judgment rather than earning a fresh rework budget — the run
+      has already consumed its patience.
+    - The count is in-memory only (edge conditions aren't part of
+      GraphFlow's checkpoint), so a `--resume` resets it and can allow up
+      to `max_fails - 1` additional rework loops. Accepted: the loops are
+      productive work, and the raised TokenCountTermination safety net
+      plus MaxMessageTermination still bound the run.
+    """
+
+    def __init__(self, max_fails: int) -> None:
+        self._max_fails = max_fails
+        self.fail_count = 0
+        self._counted: set[int] = set()
+
+    def _register_fail(self, message: BaseChatMessage) -> int:
+        key = id(message)
+        if key not in self._counted:
+            self._counted.add(key)
+            self.fail_count += 1
+        return self.fail_count
+
+    def rework(self, message: BaseChatMessage) -> bool:
+        """QA → engineers: fires for a QA_FAIL while rework budget remains."""
+        if last_line(message.to_text()) != "QA_FAIL":
+            return False
+        return self._register_fail(message) < self._max_fails
+
+    def to_uat(self, message: BaseChatMessage) -> bool:
+        """QA → UAT: fires for QA_PASS (the normal path), or for the final
+        QA_FAIL once the rework budget is exhausted (the shippability
+        judgment path)."""
+        verdict = last_line(message.to_text())
+        if verdict == "QA_PASS":
+            return True
+        if verdict == "QA_FAIL":
+            return self._register_fail(message) >= self._max_fails
+        return False
+
+
 def build_team(
     workspace: Path,
     agent_cls: type[ClaudeCodeAgent] = ClaudeCodeAgent,
     on_event: OnEvent | None = None,
     architect_addendum: str | None = None,
     output_dir: Path | None = None,
+    role_addenda: Mapping[str, str] | None = None,
 ) -> tuple[GraphFlow, dict[str, ClaudeCodeAgent]]:
     """Build the pipeline. Every agent runs via a real claude_agent_sdk
     session authenticated through the `claude` CLI's own OAuth login — no
@@ -430,6 +539,21 @@ def build_team(
     max_parallel = int(os.environ.get("LOOPER_MAX_PARALLEL_SESSIONS", "0") or 0)
     session_limiter = asyncio.Semaphore(max_parallel) if max_parallel > 0 else None
 
+    # Per-SESSION dollar cap (SDK-enforced; an exceeded session degrades to
+    # partial output like max_turns, it doesn't crash the run — see
+    # ClaudeCodeAgent). Complements the run-level LOOPER_MAX_RUN_BUDGET_USD
+    # cap enforced by runner.FailFastMonitor across all sessions. Unset =
+    # uncapped, the historical behavior.
+    _session_budget_raw = os.environ.get("LOOPER_MAX_SESSION_BUDGET_USD", "")
+    session_budget_usd = float(_session_budget_raw) if _session_budget_raw else None
+
+    # Per-role prompt addenda (runtime-composed context, same pattern as
+    # architect_addendum): today this carries run_memory's cross-run defect
+    # hints into engineer prompts ("your role produced these BLOCKER/MAJOR
+    # defects in earlier runs..."). Appended after the role's static prompt,
+    # never edited into prompts.py/SPEC.md themselves.
+    addenda = dict(role_addenda) if role_addenda is not None else {}
+
     def code_agent(
         name: str,
         description: str,
@@ -442,6 +566,9 @@ def build_team(
         extra_env: dict[str, str] | None = None,
     ) -> ClaudeCodeAgent:
         kwargs = {} if allowed_tools is None else {"allowed_tools": allowed_tools}
+        addendum = addenda.get(name)
+        if addendum:
+            prompt = f"{prompt}\n\n{addendum}"
         return agent_cls(
             name=name,
             description=description,
@@ -454,6 +581,7 @@ def build_team(
             sdk_log_path=sdk_log_path,
             session_limiter=session_limiter,
             extra_env=extra_env,
+            max_budget_usd=session_budget_usd,
             **kwargs,
         )
 
@@ -636,6 +764,12 @@ def build_team(
     builder.add_edge(pm, scope_validator)
     builder.add_edge(scope_validator, architect)
 
+    # QA's outgoing edges route through a stateful QaVerdictRouter (see its
+    # docstring): the first MAX_QA_LOOPS-1 QA_FAILs go to the engineers for
+    # rework; the final one goes to UAT for a shippability judgment instead
+    # of hard-killing the run.
+    qa_router = QaVerdictRouter(MAX_QA_LOOPS)
+
     # Fan-out to engineers. Each engineer has two ways to activate — the
     # architect's design (first pass) or a QA_FAIL rework loop — so both
     # edges share one activation group with "any" semantics; the default
@@ -648,7 +782,7 @@ def build_team(
         builder.add_edge(
             qa,
             eng,
-            condition=verdict_is("QA_FAIL"),
+            condition=qa_router.rework,
             activation_group=group,
             activation_condition="any",
         )
@@ -658,7 +792,8 @@ def build_team(
     builder.add_edge(be, qa)
     builder.add_edge(ops, qa)
 
-    builder.add_edge(qa, uat, condition=verdict_is("QA_PASS"))
+    # QA_PASS, or the final QA_FAIL after the rework budget is exhausted.
+    builder.add_edge(qa, uat, condition=qa_router.to_uat)
 
     # UAT rejection loops back to grooming. PM is also the entry point, so
     # this edge needs "any" activation for the same reason as the engineers.
@@ -679,8 +814,13 @@ def build_team(
     graph = builder.build()
 
     termination = (
-        # 3rd QA_FAIL ⇒ PIPELINE_FAILED; 2nd UAT_REJECTED ⇒ re-scope only once.
-        TokenCountTermination("QA_FAIL", source=qa.name, max_count=MAX_QA_LOOPS)
+        # QA_FAIL no longer hard-kills the run at MAX_QA_LOOPS — the
+        # QaVerdictRouter routes the final fail to UAT for a shippability
+        # judgment instead. This raised count is purely a runaway guard:
+        # it can only fire if that routing breaks (or a resumed run's
+        # reset router allows extra loops) and QA keeps failing anyway.
+        # 2nd UAT_REJECTED ⇒ re-scope happened once already, stop.
+        TokenCountTermination("QA_FAIL", source=qa.name, max_count=MAX_QA_LOOPS + 2)
         | TokenCountTermination("UAT_REJECTED", source=uat.name, max_count=2)
         | MaxMessageTermination(MAX_MESSAGES)
     )

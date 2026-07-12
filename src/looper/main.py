@@ -20,13 +20,21 @@ from .pipeline import (
     ARTIFACT_DIR_NAME,
     SDK_LOG_FILE_NAME,
     apply_turn_budget_from_architect,
+    apply_deploy_verify_budget,
     apply_visual_qa_budget,
     build_team,
     reapply_turn_budget_on_resume,
     recover_stuck_agents,
     reset_pending_activation_flags,
 )
-from .run_memory import calibration_hint, load_runs, record_run, summarize_run
+from .recovery import acquire_run_lock, compute_retry_delay, release_run_lock
+from .run_memory import (
+    calibration_hint,
+    defect_history_hints,
+    load_runs,
+    record_run,
+    summarize_run,
+)
 from .runner import FailFastMonitor, run_team
 
 
@@ -40,56 +48,87 @@ async def _checkpoint(team: GraphFlow, checkpoint_path: Path, stamp: str, goal: 
     )
 
 
+async def _restore_from_checkpoint(
+    checkpoint_data: dict,
+    monitor: FailFastMonitor,
+    hint: str | None,
+    defect_hints: dict,
+    output_dir: Path,
+):
+    """Rebuild a team from a checkpoint dict and repair everything a raw
+    `load_state()` alone gets wrong — one shared implementation for the
+    manual `--resume` path and the auto-resume recovery loop, so the two
+    can never drift apart. Each repair traces to a real reproduced bug;
+    see the respective functions' docstrings."""
+    stamp = checkpoint_data["stamp"]
+    goal = checkpoint_data["goal"]
+    workspace = Path(checkpoint_data["workspace"])
+    team, agents = build_team(
+        workspace,
+        on_event=monitor.on_event,
+        architect_addendum=hint,
+        output_dir=output_dir,
+        role_addenda=defect_hints,
+    )
+    # Crash mid-fan-out: a dispatched-but-never-finished agent leaves no
+    # trace in GraphFlow's own checkpoint — re-enqueue via the agent-level
+    # turn_in_progress flag (see recover_stuck_agents()).
+    recovered = recover_stuck_agents(checkpoint_data["team_state"])
+    if recovered:
+        print(f"Recovered stuck agent(s) from crashed turn: {', '.join(recovered)}")
+    # A node still sitting in the checkpointed "ready" queue needs its
+    # "any"-activation flag re-armed or a later loop-back edge (QA_FAIL)
+    # is silently swallowed (see reset_pending_activation_flags()).
+    reset_flags = reset_pending_activation_flags(checkpoint_data["team_state"])
+    if reset_flags:
+        print(f"Reset stale activation flags for resume: {', '.join(reset_flags)}")
+    await team.load_state(checkpoint_data["team_state"])
+    # Dynamic budgets are in-memory only — re-derive from the on-disk
+    # design (see reapply_turn_budget_on_resume() for why NOT from any
+    # agent's replayed history).
+    reapplied = reapply_turn_budget_on_resume(workspace, agents)
+    if reapplied:
+        print(f"Turn budget re-applied from disk on resume: {reapplied}")
+    # Run-level dollar cap covers the WHOLE run across resumes: seed the
+    # counter with everything already spent, per the authoritative SDK log.
+    already_spent = summarize_run(workspace, stamp, goal, None)["total_cost_usd"]
+    if already_spent:
+        monitor.seed_spent(already_spent)
+        print(f"Run-budget counter seeded with ${already_spent:.2f} already spent before this resume")
+    return team, agents, stamp, goal, workspace
+
+
 async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    monitor = FailFastMonitor()
+    # Run-level dollar ceiling (across every agent's sessions, cumulative;
+    # see runner.FailFastMonitor). Unset = uncapped. A resumed run seeds the
+    # counter from what the interrupted run already spent (below).
+    _run_budget_raw = os.environ.get("LOOPER_MAX_RUN_BUDGET_USD", "")
+    monitor = FailFastMonitor(
+        max_run_budget_usd=float(_run_budget_raw) if _run_budget_raw else None
+    )
 
     # Cross-run memory (run_memory.py): if past runs' engineer sessions have
     # been running out of their estimated turn budgets, tell the architect
     # so this run's estimates are sized better. None (no history / no hits)
     # leaves the prompt untouched.
-    hint = calibration_hint(load_runs(output_dir))
+    past_runs = load_runs(output_dir)
+    hint = calibration_hint(past_runs)
     if hint:
         print(f"Architect calibration from past runs: {hint}\n")
+    # Per-engineer recurring-defect hints (run_memory.defect_history_hints):
+    # BLOCKER/MAJOR defects each role produced in past runs, injected into
+    # that role's prompt so the same class of mistake isn't repeated.
+    defect_hints = defect_history_hints(past_runs)
+    if defect_hints:
+        print(f"Defect-history hints injected for: {', '.join(sorted(defect_hints))}\n")
 
     if resume is not None:
         checkpoint_data = json.loads(resume.read_text())
-        stamp = checkpoint_data["stamp"]
-        goal = checkpoint_data["goal"]
-        workspace = Path(checkpoint_data["workspace"])
-        team, agents = build_team(workspace, on_event=monitor.on_event, architect_addendum=hint, output_dir=output_dir)
-        # A crash mid-fan-out (e.g. devops_engineer fails while
-        # frontend_engineer/backend_engineer succeed) leaves GraphFlow's own
-        # checkpoint with no record that the crashed node was dispatched but
-        # never finished — see recover_stuck_agents()'s docstring for why.
-        # Patch the raw checkpoint dict before load_state() so that agent
-        # actually retries instead of the resumed run completing zero turns.
-        recovered = recover_stuck_agents(checkpoint_data["team_state"])
-        if recovered:
-            print(f"Recovered stuck agent(s) from crashed turn: {', '.join(recovered)}")
-        # A second, deeper gap than the one above: a node sitting in the
-        # checkpointed "ready" queue (whether it was already there, or just
-        # added back by recover_stuck_agents()) needs its activation
-        # group's enqueued flag reset, or a LATER loop-back edge into that
-        # same group (e.g. QA_FAIL) silently never fires. See
-        # reset_pending_activation_flags()'s docstring — real, reproduced
-        # bug, not a defensive guess.
-        reset_flags = reset_pending_activation_flags(checkpoint_data["team_state"])
-        if reset_flags:
-            print(f"Reset stale activation flags for resume: {', '.join(reset_flags)}")
-        await team.load_state(checkpoint_data["team_state"])
-        # set_max_turns() overrides aren't part of the checkpoint (only
-        # _history is) — if the architect's turn already completed before
-        # the crash, re-derive the same dynamic budget from its on-disk
-        # pointer file rather than silently falling back to the static
-        # default on the retry. See reapply_turn_budget_on_resume()'s
-        # docstring for why this reads the file instead of any specific
-        # engineer's replayed history — a real, reproduced race where the
-        # naive history-based version silently failed.
-        reapplied = reapply_turn_budget_on_resume(workspace, agents)
-        if reapplied:
-            print(f"Turn budget re-applied from disk on resume: {reapplied}")
+        team, agents, stamp, goal, workspace = await _restore_from_checkpoint(
+            checkpoint_data, monitor, hint, defect_hints, output_dir
+        )
         task = None  # continue the previous task rather than starting a new one
         print(f"Resuming run {stamp} from {resume}\nWorkspace: {workspace}\n")
     else:
@@ -97,7 +136,7 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         workspace = output_dir / "workspace" / stamp
         workspace.mkdir(parents=True, exist_ok=True)
-        team, agents = build_team(workspace, on_event=monitor.on_event, architect_addendum=hint, output_dir=output_dir)
+        team, agents = build_team(workspace, on_event=monitor.on_event, architect_addendum=hint, output_dir=output_dir, role_addenda=defect_hints)
         task = goal
 
     checkpoint_path = output_dir / "checkpoints" / f"{stamp}.json"
@@ -139,21 +178,73 @@ async def run(goal: str | None, output_dir: Path, resume: Path | None) -> None:
         visual_qa_extra = apply_visual_qa_budget(message, agents, agents["qa_engineer"].max_turns)
         if visual_qa_extra:
             print(f"QA visual-verification budget applied from architect: +{visual_qa_extra} turns")
+        # ...and QA's deploy-verification pass (compose build/up + health
+        # checks). Called after the visual bump so both extras stack.
+        deploy_extra = apply_deploy_verify_budget(message, agents, agents["qa_engineer"].max_turns)
+        if deploy_extra:
+            print(f"QA deploy-verification budget applied from architect: +{deploy_extra} turns")
         # Checkpoint after every completed agent turn, so a failure
         # (crash, hitting the Claude Code session limit, etc.) only
         # loses the turn in flight — not the whole run.
         await _checkpoint(team, checkpoint_path, stamp, goal, workspace)
 
+    # Per-run PID lock: closes the documented double-resume hazard (two
+    # --resume invocations against the same checkpoint once ran
+    # concurrently against the same workspace — see README). Stale locks
+    # from a crashed holder are taken over automatically.
+    lock_path = output_dir / "locks" / f"{stamp}.lock"
+    if not acquire_run_lock(lock_path):
+        raise RuntimeError(
+            f"Another process (PID {lock_path.read_text().strip()}) is already running "
+            f"run {stamp} — refusing to start a second one against the same workspace. "
+            f"Verify it has exited (ps) before retrying; a stale lock from a dead "
+            f"process is taken over automatically."
+        )
+
+    # Auto-resume loop: a session-limit failure waits out the printed
+    # reset time and resumes itself from the latest checkpoint; any other
+    # failure gets a short bounded backoff and one retry cycle — the
+    # decisions live in recovery.compute_retry_delay(), this loop just
+    # executes them. LOOPER_AUTO_RESUME=0 disables it entirely
+    # (pre-autonomous behavior: print --resume instructions and exit).
+    auto_resume = os.environ.get("LOOPER_AUTO_RESUME", "1") != "0"
+    max_auto_resumes = int(os.environ.get("LOOPER_MAX_AUTO_RESUMES", "3") or 3)
+    attempt = 0
     try:
-        # run_team stops the whole run the instant any single agent
-        # reports a failure (see runner.py) — it does not wait for the
-        # other engineers to also finish or fail on their own.
-        stop_reason = await run_team(team, task, on_message, monitor)
-    except Exception as exc:
-        print(f"\nRun failed: {exc}")
-        print(f"Progress checkpointed to {checkpoint_path} — resume with:")
-        print(f'  PYTHONPATH=src python -m looper.main --resume "{checkpoint_path}"')
-        raise
+        while True:
+            try:
+                # run_team stops the whole run the instant any single agent
+                # reports a failure (see runner.py) — it does not wait for
+                # the other engineers to also finish or fail on their own.
+                stop_reason = await run_team(team, task, on_message, monitor)
+                break
+            except Exception as exc:
+                delay = (
+                    compute_retry_delay(str(exc), attempt)
+                    if auto_resume and checkpoint_path.exists()
+                    else None
+                )
+                if delay is None or attempt >= max_auto_resumes:
+                    print(f"\nRun failed: {exc}")
+                    print(f"Progress checkpointed to {checkpoint_path} — resume with:")
+                    print(f'  PYTHONPATH=src python -m looper.main --resume "{checkpoint_path}"')
+                    raise
+                attempt += 1
+                print(f"\nRun interrupted: {exc}")
+                print(
+                    f"Auto-resume {attempt}/{max_auto_resumes}: waiting "
+                    f"{delay / 60:.1f} min, then resuming from {checkpoint_path}"
+                )
+                await asyncio.sleep(delay)
+                monitor.reset()
+                checkpoint_data = json.loads(checkpoint_path.read_text())
+                team, agents, stamp, goal, workspace = await _restore_from_checkpoint(
+                    checkpoint_data, monitor, hint, defect_hints, output_dir
+                )
+                task = None
+                print(f"Auto-resumed run {stamp}\n")
+    finally:
+        release_run_lock(lock_path)
 
     # Record this run into cross-run memory (aggregated from the SDK
     # interaction log) — completion path only, so a crashed-then-resumed run

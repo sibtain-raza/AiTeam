@@ -20,10 +20,17 @@ from looper.claude_code_agent import ClaudeCodeAgent
 from looper.pipeline import (
     ARTIFACT_DIR_NAME,
     apply_turn_budget_from_architect,
+    apply_deploy_verify_budget,
     apply_visual_qa_budget,
     build_team,
 )
-from looper.run_memory import calibration_hint, load_runs, record_run, summarize_run
+from looper.run_memory import (
+    calibration_hint,
+    defect_history_hints,
+    load_runs,
+    record_run,
+    summarize_run,
+)
 from looper.runner import FailFastMonitor, run_team
 
 from .db import SessionLocal
@@ -109,19 +116,26 @@ async def run_pipeline(run_id: str, goal: str, agent_cls: type[ClaudeCodeAgent] 
     # Claude Code quota — against a pipeline that's already doomed. See
     # looper/runner.py for why this doesn't rely on GraphFlow's own error
     # propagation (confirmed live: it doesn't work reliably).
-    monitor = FailFastMonitor(on_event)
+    _run_budget_raw = os.environ.get("LOOPER_MAX_RUN_BUDGET_USD", "")
+    monitor = FailFastMonitor(
+        on_event, max_run_budget_usd=float(_run_budget_raw) if _run_budget_raw else None
+    )
 
     workspace.mkdir(parents=True, exist_ok=True)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     # Cross-run memory: same calibration-hint flow as main.py — shared
     # output/memory/runs.jsonl, so CLI and web runs learn from each other.
-    hint = calibration_hint(load_runs(OUTPUT_DIR))
+    past_runs = load_runs(OUTPUT_DIR)
+    hint = calibration_hint(past_runs)
     team, agents = build_team(
         workspace,
         agent_cls=agent_cls,
         on_event=monitor.on_event,
         architect_addendum=hint,
         output_dir=OUTPUT_DIR,
+        # Per-engineer recurring-defect hints from past runs' QA reports —
+        # same cross-run memory flow as main.py.
+        role_addenda=defect_history_hints(past_runs),
     )
 
     await _record_event(run_id, seq_counter, "system", "run_started", goal, {})
@@ -154,6 +168,13 @@ async def run_pipeline(run_id: str, goal: str, agent_cls: type[ClaudeCodeAgent] 
         if visual_qa_extra:
             await _record_event(
                 run_id, seq_counter, "system", "visual_qa_budget_applied", f"+{visual_qa_extra} turns", {}
+            )
+        # ...and QA's deploy-verification pass; stacks on top of the visual
+        # bump (called after it, with QA's then-current budget as base).
+        deploy_extra = apply_deploy_verify_budget(message, agents, agents["qa_engineer"].max_turns)
+        if deploy_extra:
+            await _record_event(
+                run_id, seq_counter, "system", "deploy_verify_budget_applied", f"+{deploy_extra} turns", {}
             )
 
         state = await team.save_state()

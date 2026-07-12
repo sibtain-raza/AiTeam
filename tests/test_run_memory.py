@@ -16,6 +16,7 @@ from pathlib import Path
 from looper.pipeline import ARTIFACT_DIR_NAME, SDK_LOG_FILE_NAME, build_team
 from looper.run_memory import (
     calibration_hint,
+    defect_history_hints,
     load_runs,
     memory_path,
     record_run,
@@ -125,6 +126,78 @@ class CalibrationHintTests(unittest.TestCase):
         old = {"per_agent": {"backend_engineer": {"sessions": 1, "max_turns_hits": 1}}}
         recent = {"per_agent": {"backend_engineer": {"sessions": 1, "max_turns_hits": 0}}}
         self.assertIsNone(calibration_hint([old, recent], window=1))
+
+
+class DefectHistoryHintsTests(unittest.TestCase):
+    """Cross-run defect memory: BLOCKER/MAJOR defects from past runs' QA
+    reports become per-engineer prompt hints. MINOR defects and roles with
+    no qualifying defects stay silent (silence beats noise)."""
+
+    def setUp(self) -> None:
+        self.output_dir = Path(tempfile.mkdtemp(prefix="looper_defect_hints_"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.output_dir, ignore_errors=True)
+
+    def _make_run(self, stamp: str, qa_response: str) -> dict:
+        workspace = self.output_dir / "workspace" / stamp
+        _write_sdk_log(workspace, [_entry("qa_engineer", response=qa_response)])
+        return {"stamp": stamp, "goal": "g", "workspace": str(workspace), "per_agent": {}}
+
+    def test_blocker_and_major_reach_the_owning_role(self) -> None:
+        runs = [
+            self._make_run(
+                "r1",
+                "**D-1 | BLOCKER | AC-1 backend build fails under noUnusedParameters | [BE]**\n"
+                "**D-2 | MAJOR | AC-6 empty-state copy never reachable | [FE]**\n"
+                "**D-3 | MINOR | AC-9 nitpick | [OPS]**\n"
+                "QA_FAIL",
+            )
+        ]
+        hints = defect_history_hints(runs)
+        self.assertIn("backend_engineer", hints)
+        self.assertIn("noUnusedParameters", hints["backend_engineer"])
+        self.assertIn("[BLOCKER]", hints["backend_engineer"])
+        self.assertIn("frontend_engineer", hints)
+        self.assertIn("empty-state copy", hints["frontend_engineer"])
+        # MINOR-only role gets no hint at all.
+        self.assertNotIn("devops_engineer", hints)
+
+    def test_dedupes_reverified_defects_within_a_run(self) -> None:
+        run = self._make_run("r1", "**D-1 | BLOCKER | AC-1 broken build | [BE]**\nQA_FAIL")
+        # Second QA pass re-verifies the same D-1.
+        workspace = Path(run["workspace"])
+        _write_sdk_log(
+            workspace,
+            [
+                _entry("qa_engineer", response="**D-1 | BLOCKER | AC-1 broken build | [BE]**\nQA_FAIL"),
+                _entry("qa_engineer", response="- **D-1** BLOCKER [BE] — FIXED\nQA_PASS"),
+            ],
+        )
+        hints = defect_history_hints([run])
+        self.assertEqual(hints["backend_engineer"].count("[BLOCKER]"), 1)
+
+    def test_per_role_cap_limits_hint_length(self) -> None:
+        lines = "\n".join(
+            f"**D-{i} | MAJOR | AC-{i} distinct issue number {i} | [BE]**" for i in range(1, 7)
+        )
+        runs = [self._make_run("r1", lines + "\nQA_FAIL")]
+        hints = defect_history_hints(runs, per_role=2)
+        self.assertEqual(hints["backend_engineer"].count("[MAJOR]"), 2)
+
+    def test_no_history_or_clean_runs_mean_no_hints(self) -> None:
+        self.assertEqual(defect_history_hints([]), {})
+        runs = [self._make_run("r1", "# QA REPORT\nAll clean.\nQA_PASS")]
+        self.assertEqual(defect_history_hints(runs), {})
+
+    def test_role_addenda_reach_engineer_prompts_via_build_team(self) -> None:
+        _, agents = build_team(
+            self.output_dir / "workspace" / "x",
+            agent_cls=ScriptedClaudeCodeAgent,
+            role_addenda={"backend_engineer": "PAST QA FINDINGS: don't break the build again."},
+        )
+        self.assertIn("PAST QA FINDINGS", agents["backend_engineer"]._system_prompt)
+        self.assertNotIn("PAST QA FINDINGS", agents["frontend_engineer"]._system_prompt)
 
 
 class ArchitectAddendumTests(unittest.TestCase):

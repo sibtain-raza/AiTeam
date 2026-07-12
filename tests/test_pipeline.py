@@ -106,14 +106,40 @@ class PipelineOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(src.count("product_manager"), 1)
         self.assertEqual(src.count("solution_architect"), 1)
 
-    async def test_qa_hard_fail_terminates_pipeline(self) -> None:
-        """3 consecutive QA_FAILs hard-stop the run with PIPELINE_FAILED, never reaching UAT."""
-        result = await self._run({**BASE_SCRIPT, "qa_engineer": [QA_FAIL_TEXT]})
-        self.assertIn("PIPELINE_FAILED", result.stop_reason or "")
+    async def test_exhausted_rework_budget_routes_to_uat_for_shippability_judgment(self) -> None:
+        """Graceful degradation: the 3rd QA_FAIL no longer hard-kills the
+        run — QaVerdictRouter routes it to UAT, whose prompt makes the
+        final ship-with-known-issues / reject call. Here UAT approves:
+        the run completes normally with a release report, and the open
+        defects are UAT's to document, not a PIPELINE_FAILED stop."""
+        result = await self._run(
+            {
+                **BASE_SCRIPT,
+                "qa_engineer": [QA_FAIL_TEXT],  # fails every time
+                "uat_reviewer": [UAT_APPROVED_TEXT],
+            }
+        )
         src = sources(result.messages)
-        self.assertEqual(src.count("qa_engineer"), 3)
-        self.assertNotIn("uat_reviewer", src)
-        self.assertNotIn("release_reporter", src)
+        self.assertEqual(src.count("qa_engineer"), 3, "two rework loops, then the final fail")
+        self.assertEqual(src.count("frontend_engineer"), 3, "initial pass + two reworks")
+        self.assertEqual(src.count("uat_reviewer"), 1, "the final QA_FAIL reaches UAT")
+        self.assertEqual(src.count("release_reporter"), 1)
+        self.assertNotIn("PIPELINE_FAILED", result.stop_reason or "")
+
+    async def test_exhausted_rework_budget_uat_can_still_reject(self) -> None:
+        """The judgment path's other branch: UAT deems the remaining
+        defects unshippable and rejects — triggering the normal one
+        re-scope loop, bounded by the existing UAT_REJECTED termination."""
+        result = await self._run(
+            {
+                **BASE_SCRIPT,
+                "qa_engineer": [QA_FAIL_TEXT],
+                "uat_reviewer": [UAT_REJECTED_TEXT],  # rejects every time
+            }
+        )
+        src = sources(result.messages)
+        self.assertGreaterEqual(src.count("uat_reviewer"), 1)
+        self.assertNotIn("release_reporter", src, "a rejected run must not produce a release report")
 
     async def test_uat_rejection_loop_then_approve(self) -> None:
         """UAT_REJECTED once loops back to PM grooming; UAT_APPROVED on retry proceeds to done."""

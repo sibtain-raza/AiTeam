@@ -85,7 +85,9 @@ USER GOAL
    ▼
 [QA Engineer] — reads the real files in the workspace, runs real builds/tests/lint against them
    │
-   ├── QA_FAIL (up to 3 loops) ──► only the owning engineer(s) rework — QA's defect tags route it
+   ├── QA_FAIL #1-#2 ──► only the owning engineer(s) rework — QA's defect tags route it
+   ├── QA_FAIL #3 (rework budget exhausted) ──► UAT makes the final shippability call
+   │                                            (approve with Known Issues, or reject)
    └── QA_PASS
           │
           ▼
@@ -278,6 +280,10 @@ If a run fails partway (Claude session/usage limit, a crash, anything), resume i
 | `LOOPER_CODE_MODEL` | `sonnet` | Model override for all 9 agents. Default is `sonnet` (a CLI alias for the latest Sonnet model, verified via `claude --help`) rather than Claude Code's own default (typically Opus-tier) — cheaper/faster given how many real sessions one run consumes; set to `opus` or a specific model string for higher-judgment work. |
 | `LOOPER_CODE_MODEL_<AGENT_NAME>` | — | Per-role override beating the global, e.g. `LOOPER_CODE_MODEL_RELEASE_REPORTER=haiku`. Reasoning turns are only ~7% of a measured real run's cost, and PM/architect quality steers everything downstream — the safe downgrades are `RELEASE_REPORTER` and `UAT_REVIEWER`. |
 | `LOOPER_MAX_PARALLEL_SESSIONS` | unbounded | Cap concurrent Claude Code sessions across the team (only the FE/BE/OPS fan-out exceeds one). Set `1`–`2` if parallel sessions trip your account-wide session limit mid-run. |
+| `LOOPER_MAX_SESSION_BUDGET_USD` | uncapped | Hard dollar ceiling per Claude Code session. An exceeded session degrades to partial output (like hitting max_turns), it doesn't crash the run. |
+| `LOOPER_MAX_RUN_BUDGET_USD` | uncapped | Hard dollar ceiling for the whole run, cumulative across every agent's sessions (and across resumes). Exceeding it stops the run after the completed turn with a resumable checkpoint. |
+| `LOOPER_AUTO_RESUME` | `1` | Autonomous crash recovery: a session-limit failure waits out the reset time printed in the error and resumes itself from the checkpoint; other failures get a short bounded backoff. Set `0` for the old print-`--resume`-instructions-and-exit behavior. |
+| `LOOPER_MAX_AUTO_RESUMES` | `3` | How many automatic resumes one invocation may perform before giving up. |
 | `LOOPER_OUTPUT_DIR` | `output` | Directory for transcripts, workspaces, and checkpoints |
 
 **Visual QA** (no env var — architect-decided per goal): most goals get `VISUAL_QA: NO` from the architect and QA does its normal code-only review. For a goal with real custom animation/interaction design, the architect can instead grant QA extra turns to build the app, drive it with Playwright, and `Read` back screenshots to catch layout/rendering defects a text-only review can't. This is a real render-and-look step, but it's still a frozen-frame/short-clip check — it cannot judge subjective "feel," smoothness, or animation polish, and QA's own report says so rather than overclaiming it.

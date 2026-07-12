@@ -36,6 +36,7 @@ log itself remain the audit trail).
 import json
 from pathlib import Path
 
+from .artifacts import Defect, parse_defects
 from .pipeline import ARTIFACT_DIR_NAME, SDK_LOG_FILE_NAME
 from .termination import last_line
 
@@ -44,6 +45,27 @@ MEMORY_FILE_NAME = "runs.jsonl"
 
 _ENGINEER_AGENTS = ("frontend_engineer", "backend_engineer", "devops_engineer")
 _MAX_TURNS_ERROR = "hit max_turns before finishing"
+_OWNER_TAG_TO_AGENT = {"FE": "frontend_engineer", "BE": "backend_engineer", "OPS": "devops_engineer"}
+
+
+def load_sdk_entries(workspace: Path) -> list[dict]:
+    """All parsed JSON lines from a run workspace's SDK interaction log
+    (see pipeline.SDK_LOG_FILE_NAME); [] if missing. Shared by
+    summarize_run(), defect_history_hints() (below) and report.py —
+    it lives here rather than report.py because report imports this
+    module, not the other way around."""
+    log_file = workspace / ARTIFACT_DIR_NAME / SDK_LOG_FILE_NAME
+    if not log_file.exists():
+        return []
+    entries = []
+    for line in log_file.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries
 
 
 def memory_path(output_dir: Path) -> Path:
@@ -59,29 +81,21 @@ def summarize_run(workspace: Path, stamp: str, goal: str, stop_reason: str | Non
     total_duration_ms = 0
     qa_fail_rounds = 0
 
-    log_file = workspace / ARTIFACT_DIR_NAME / SDK_LOG_FILE_NAME
-    if log_file.exists():
-        for line in log_file.read_text().splitlines():
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            agent = entry.get("agent", "unknown")
-            stats = per_agent.setdefault(
-                agent,
-                {"sessions": 0, "cost_usd": 0.0, "max_turns_hits": 0, "last_max_turns": None},
-            )
-            stats["sessions"] += 1
-            stats["cost_usd"] += entry.get("cost_usd") or 0.0
-            stats["last_max_turns"] = entry.get("max_turns")
-            if entry.get("error") == _MAX_TURNS_ERROR:
-                stats["max_turns_hits"] += 1
-            total_cost += entry.get("cost_usd") or 0.0
-            total_duration_ms += entry.get("duration_ms") or 0
-            if agent == "qa_engineer" and last_line(entry.get("response") or "") == "QA_FAIL":
-                qa_fail_rounds += 1
+    for entry in load_sdk_entries(workspace):
+        agent = entry.get("agent", "unknown")
+        stats = per_agent.setdefault(
+            agent,
+            {"sessions": 0, "cost_usd": 0.0, "max_turns_hits": 0, "last_max_turns": None},
+        )
+        stats["sessions"] += 1
+        stats["cost_usd"] += entry.get("cost_usd") or 0.0
+        stats["last_max_turns"] = entry.get("max_turns")
+        if entry.get("error") == _MAX_TURNS_ERROR:
+            stats["max_turns_hits"] += 1
+        total_cost += entry.get("cost_usd") or 0.0
+        total_duration_ms += entry.get("duration_ms") or 0
+        if agent == "qa_engineer" and last_line(entry.get("response") or "") == "QA_FAIL":
+            qa_fail_rounds += 1
 
     return {
         "stamp": stamp,
@@ -172,3 +186,64 @@ def calibration_hint(runs: list[dict], window: int = 10) -> str | None:
         f"an unused turn costs nothing, while an exhausted budget produces incomplete, "
         f"unverified work and a full QA rework loop."
     )
+
+
+def defect_history_hints(
+    runs: list[dict], window: int = 10, per_role: int = 3
+) -> dict[str, str]:
+    """Per-engineer prompt addenda derived from past runs' QA reports: the
+    most recent BLOCKER/MAJOR defects each role produced, so the next run's
+    engineer can avoid repeating the same class of mistake. The deeper
+    counterpart to calibration_hint() — that one teaches the architect
+    about budgets; this one teaches the engineers about their own recurring
+    failure patterns (e.g. a real run's "backend build fails: unused param
+    under noUnusedParameters" is exactly the kind of mistake a one-line
+    reminder prevents cheaply).
+
+    Reads each recorded run's SDK log (via its `workspace` pointer) and
+    parses every qa_engineer response with artifacts.parse_defects(),
+    deduping by id within a run (ids are immutable across rework loops,
+    global rule 4 — a re-verified D-1 is the same defect). MINOR defects
+    are excluded: hints are for mistakes that cost rework loops, and a
+    prompt full of nitpicks dilutes the signal. Returns {agent_name: hint}
+    for roles with at least one qualifying defect — an empty dict when
+    there's nothing to learn, mirroring calibration_hint()'s
+    silence-beats-noise rule.
+    """
+    # Most recent runs first, so the hint leads with the freshest patterns.
+    per_agent: dict[str, list[str]] = {}
+    for run in reversed(runs[-window:]):
+        workspace = run.get("workspace")
+        if not workspace:
+            continue
+        seen_ids: set[str] = set()
+        run_defects: list[Defect] = []
+        for entry in load_sdk_entries(Path(workspace)):
+            if entry.get("agent") != "qa_engineer" or not entry.get("response"):
+                continue
+            for defect in parse_defects(entry["response"]):
+                if defect.id in seen_ids:
+                    continue
+                seen_ids.add(defect.id)
+                run_defects.append(defect)
+        for defect in run_defects:
+            if defect.severity not in ("BLOCKER", "MAJOR") or not defect.summary:
+                continue
+            for owner in defect.owners:
+                agent = _OWNER_TAG_TO_AGENT.get(owner)
+                if agent is None:
+                    continue
+                lines = per_agent.setdefault(agent, [])
+                if len(lines) < per_role:
+                    lines.append(f"- [{defect.severity}] {defect.summary}")
+
+    hints: dict[str, str] = {}
+    for agent, lines in per_agent.items():
+        hints[agent] = (
+            "PAST QA FINDINGS (recurring-defect memory from this pipeline's "
+            "previous runs, most recent first): your role produced these "
+            "BLOCKER/MAJOR defects in earlier runs. Before finishing, "
+            "double-check you are not repeating the same class of mistake:\n"
+            + "\n".join(lines)
+        )
+    return hints

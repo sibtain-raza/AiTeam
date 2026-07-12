@@ -20,9 +20,12 @@ from autogen_agentchat.messages import TextMessage
 
 from looper.pipeline import (
     ARTIFACT_DIR_NAME,
+    MAX_DEPLOY_VERIFY_EXTRA_TURNS,
     MAX_VISUAL_QA_EXTRA_TURNS,
+    apply_deploy_verify_budget,
     apply_visual_qa_budget,
     build_team,
+    parse_deploy_verify_extra_turns,
     parse_visual_qa_extra_turns,
     reapply_turn_budget_on_resume,
 )
@@ -101,6 +104,12 @@ DESIGN_WITHOUT_VISUAL_QA = (
     "VISUAL_QA: NO — standard internal form, no custom animation requested\n"
 )
 
+DESIGN_WITH_BOTH_GATES = (
+    DESIGN_WITH_VISUAL_QA
+    + "## Deploy Verification\n"
+    + "DEPLOY_VERIFY: YES: 12 — compose stack with health endpoints worth exercising\n"
+)
+
 
 class ParseVisualQaExtraTurnsTests(unittest.TestCase):
     def test_parses_yes_with_a_number(self) -> None:
@@ -170,6 +179,61 @@ class ApplyVisualQaBudgetTests(unittest.TestCase):
         message = TextMessage(content=DESIGN_WITH_VISUAL_QA, source="solution_architect")
         extra = apply_visual_qa_budget(message, {}, base_turns=20)
         self.assertEqual(extra, 0)
+
+
+class DeployVerifyBudgetTests(unittest.TestCase):
+    """Deploy-verification gate: identical contract to Visual QA (see
+    apply_deploy_verify_budget()'s docstring), tested for its own parsing,
+    the stacking behavior when a design grants both gates, and the resume
+    round-trip."""
+
+    def setUp(self) -> None:
+        self.workspace_dir = Path(tempfile.mkdtemp(prefix="looper_deploy_verify_test_"))
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.workspace_dir, ignore_errors=True)
+
+    def test_parses_yes_no_and_missing(self) -> None:
+        self.assertEqual(parse_deploy_verify_extra_turns(DESIGN_WITH_BOTH_GATES), 12)
+        self.assertEqual(
+            parse_deploy_verify_extra_turns("## Deploy Verification\nDEPLOY_VERIFY: NO — nothing containerized\n"),
+            0,
+        )
+        self.assertEqual(parse_deploy_verify_extra_turns("# TECH DESIGN\nno gate line\n"), 0)
+        # A YES with no number never silently grants turns.
+        self.assertEqual(parse_deploy_verify_extra_turns("DEPLOY_VERIFY: YES — forgot the number\n"), 0)
+
+    def test_clamps_to_its_own_ceiling(self) -> None:
+        text = "## Deploy Verification\nDEPLOY_VERIFY: YES: 999 — overestimated\n"
+        self.assertEqual(parse_deploy_verify_extra_turns(text), MAX_DEPLOY_VERIFY_EXTRA_TURNS)
+
+    def test_both_gates_stack_cumulatively(self) -> None:
+        """A design granting Visual QA (15) AND Deploy Verify (12) gives QA
+        base + 15 + 12 — mirroring the call order at every real call site
+        (visual first, then deploy with QA's then-current budget as base)."""
+        _team, agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        base = agents["qa_engineer"].max_turns
+        message = TextMessage(content=DESIGN_WITH_BOTH_GATES, source="solution_architect")
+
+        visual = apply_visual_qa_budget(message, agents, agents["qa_engineer"].max_turns)
+        deploy = apply_deploy_verify_budget(message, agents, agents["qa_engineer"].max_turns)
+
+        self.assertEqual(visual, 15)
+        self.assertEqual(deploy, 12)
+        self.assertEqual(agents["qa_engineer"].max_turns, base + 15 + 12)
+
+    def test_resume_reapplies_both_gates_from_disk(self) -> None:
+        _team, agents = build_team(self.workspace_dir, agent_cls=ScriptedClaudeCodeAgent)
+        base = agents["qa_engineer"].max_turns
+        docs = self.workspace_dir / ARTIFACT_DIR_NAME
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / "solution_architect.md").write_text(DESIGN_WITH_BOTH_GATES)
+
+        applied = reapply_turn_budget_on_resume(self.workspace_dir, agents)
+
+        self.assertEqual(applied.get("QA_VISUAL"), 15)
+        self.assertEqual(applied.get("QA_DEPLOY"), 12)
+        self.assertEqual(agents["qa_engineer"].max_turns, base + 27)
 
 
 class ReapplyOnResumeIncludesVisualQaTests(unittest.TestCase):
