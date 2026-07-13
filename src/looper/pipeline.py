@@ -564,6 +564,8 @@ def build_team(
         allowed_tools: Sequence[str] | None = None,
         pointer_files: dict[str, Path] | None = None,
         extra_env: dict[str, str] | None = None,
+        stall_watch_paths: list[Path] | None = None,
+        stall_exclude_paths: Sequence[Path] = (),
     ) -> ClaudeCodeAgent:
         kwargs = {} if allowed_tools is None else {"allowed_tools": allowed_tools}
         addendum = addenda.get(name)
@@ -582,6 +584,8 @@ def build_team(
             session_limiter=session_limiter,
             extra_env=extra_env,
             max_budget_usd=session_budget_usd,
+            stall_watch_paths=stall_watch_paths,
+            stall_exclude_paths=stall_exclude_paths,
             **kwargs,
         )
 
@@ -676,6 +680,7 @@ def build_team(
         max_turns=ENGINEER_MAX_TURNS,
         context_sources=ENGINEER_CONTEXT,
         pointer_files=DESIGN_POINTER,
+        stall_watch_paths=[workspace / "frontend"],
     )
     be = code_agent(
         "backend_engineer",
@@ -685,6 +690,7 @@ def build_team(
         max_turns=ENGINEER_MAX_TURNS,
         context_sources=ENGINEER_CONTEXT,
         pointer_files=DESIGN_POINTER,
+        stall_watch_paths=[workspace / "backend"],
     )
     ops = code_agent(
         "devops_engineer",
@@ -694,6 +700,17 @@ def build_team(
         max_turns=ENGINEER_MAX_TURNS,
         context_sources=ENGINEER_CONTEXT,
         pointer_files=DESIGN_POINTER,
+        # OPS owns the workspace ROOT, which FE/BE write into concurrently
+        # during the fan-out (frontend/, backend/) and main.py writes
+        # artifacts into as sibling turns complete (.pipeline-docs/) —
+        # exclude all three so a sibling's diff can't mask an OPS turn
+        # that itself changed nothing.
+        stall_watch_paths=[workspace],
+        stall_exclude_paths=[
+            workspace / "frontend",
+            workspace / "backend",
+            workspace / ARTIFACT_DIR_NAME,
+        ],
     )
     qa = code_agent(
         "qa_engineer",

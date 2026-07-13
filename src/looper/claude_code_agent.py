@@ -211,6 +211,8 @@ class ClaudeCodeAgent(BaseChatAgent):
         session_limiter: "asyncio.Semaphore | None" = None,
         extra_env: Mapping[str, str] | None = None,
         max_budget_usd: float | None = None,
+        stall_watch_paths: Sequence[Path] | None = None,
+        stall_exclude_paths: Sequence[Path] = (),
     ) -> None:
         super().__init__(name, description=description)
         self._system_prompt = system_prompt
@@ -276,6 +278,25 @@ class ClaudeCodeAgent(BaseChatAgent):
         # build_team(); complements the RUN-level ceiling enforced by
         # runner.FailFastMonitor, which sums completed turns across agents.
         self._max_budget_usd = max_budget_usd
+        # No-progress stall detection: when set, the agent's watched
+        # directories are snapshotted (path -> (size, mtime_ns)) immediately
+        # before and after each real session, and a turn whose snapshots are
+        # identical gets a prepended notice telling downstream readers (QA,
+        # and UAT at rework exhaustion) that nothing actually changed on
+        # disk. Exists for the QA rework loop: an engineer turn that talks
+        # about fixes but writes nothing burns a full paid session AND a
+        # rework iteration, and without this the only evidence was QA
+        # re-discovering the same defects one loop later. Advisory only —
+        # same philosophy as artifact validation: it annotates, nothing
+        # routes on it. None (the default) disables the check entirely;
+        # only FE/BE/OPS get watch paths in build_team(). `stall_exclude
+        # _paths` exists for OPS, whose cwd is the workspace ROOT: its
+        # siblings write frontend/ and backend/ concurrently during the
+        # fan-out, and main.py drops artifacts into .pipeline-docs/ as
+        # sibling turns complete — a root-level snapshot that counted those
+        # would mask a genuinely idle OPS turn behind FE's diff.
+        self._stall_watch_paths = list(stall_watch_paths) if stall_watch_paths is not None else None
+        self._stall_exclude_paths = [p.resolve() for p in stall_exclude_paths]
         # Model routing: LOOPER_CODE_MODEL_<AGENT_NAME> (uppercased, e.g.
         # LOOPER_CODE_MODEL_RELEASE_REPORTER=haiku) overrides the global
         # LOOPER_CODE_MODEL for that one role. Defaults stay uniform on
@@ -370,6 +391,42 @@ class ClaudeCodeAgent(BaseChatAgent):
             await self._on_event(self.name, event_type, detail, extra)
         except Exception:
             pass  # a live-status sink must never break an actual pipeline turn
+
+    def _snapshot_workspace(self) -> dict[str, tuple[int, int]] | None:
+        """Map every file under the stall-watch paths to (size, mtime_ns).
+
+        (size, mtime_ns) rather than content hashes on purpose: a stall is
+        the *absence of any write*, and any write — create, modify, delete,
+        even a same-content rewrite — perturbs mtime_ns or the key set, so
+        this can't miss one; hashing would only guard against a write that
+        somehow preserves nanosecond mtime, which isn't a real case, and
+        would make the snapshot cost scale with node_modules-sized trees.
+        Returns None when stall detection is disabled for this agent.
+        """
+        if self._stall_watch_paths is None:
+            return None
+        snapshot: dict[str, tuple[int, int]] = {}
+        for root in self._stall_watch_paths:
+            root = root.resolve()
+            if not root.is_dir():
+                continue
+            for dirpath, dirnames, filenames in os.walk(root):
+                current = Path(dirpath)
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if not any(
+                        (current / d) == ex or (current / d).is_relative_to(ex)
+                        for ex in self._stall_exclude_paths
+                    )
+                ]
+                for fname in filenames:
+                    try:
+                        st = (current / fname).stat()
+                    except OSError:
+                        continue  # deleted/unreadable mid-walk — skip, don't crash the turn
+                    snapshot[str(current / fname)] = (st.st_size, st.st_mtime_ns)
+        return snapshot
 
     def _build_prompt(self, new_sources: set[str] | None = None) -> str:
         """Render the (filtered) history as the session prompt.
@@ -495,6 +552,7 @@ class ClaudeCodeAgent(BaseChatAgent):
         prompt = self._build_prompt(new_sources={msg.source for msg in messages})
 
         self._cwd.mkdir(parents=True, exist_ok=True)
+        pre_snapshot = self._snapshot_workspace()
         system_prompt = self._system_prompt
         if self._allowed_tools:
             # Tool-less reasoning roles always finish in one turn regardless
@@ -669,6 +727,26 @@ class ClaudeCodeAgent(BaseChatAgent):
                 f"is the incomplete session's running narration, NOT a completion "
                 f"report — it may describe work that was planned but never done. "
                 f"Verify claims against the actual files on disk.\n\n{final_text}"
+            )
+        if pre_snapshot is not None and self._snapshot_workspace() == pre_snapshot:
+            # No-progress stall (see __init__'s stall_watch_paths): a full
+            # session ran and not one watched file was created, modified,
+            # or deleted. Sometimes legitimate — a rework turn whose QA
+            # defects all belong to a sibling engineer correctly changes
+            # nothing — so the notice states the fact conditionally instead
+            # of asserting failure, and nothing routes on it. Prepended
+            # before the verdict safety net (like the truncation banner) so
+            # it can never displace a QA/UAT last-line verdict.
+            await self._emit(
+                "stall_detected",
+                f"{self.name} completed a session with zero file changes in its workspace",
+            )
+            final_text = (
+                f"NOTE: this turn ran a full session but made ZERO file changes in "
+                f"this role's workspace — nothing was created, modified, or deleted. "
+                f"If this turn was supposed to implement or fix something, the text "
+                f"below describes work that did not actually happen on disk; verify "
+                f"any such claims against the files themselves.\n\n{final_text}"
             )
         final_text = self._apply_verdict_safety_net(final_text)
 
